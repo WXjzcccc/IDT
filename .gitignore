@@ -1,0 +1,17 @@
+/target/
+/*.db
+/*.sqlite
+/*.sqlite3
+/*.pdb
+/*.exe
+
+
+# Added by cargo
+
+/target
+
+
+# gpui-component docs
+/gpui-component-docs
+
+/build.ps1
