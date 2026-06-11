@@ -129,7 +129,21 @@ fn run() -> Result<()> {
 
             tray::start(tray_hwnd, tray_exit);
 
-            window.on_window_should_close(cx, move |_, _| {
+            let dashboard = cx.new(|cx| {
+                ui::Dashboard::new(
+                    database,
+                    interval_ms,
+                    exit_requested,
+                    target_hwnd,
+                    tracker,
+                    silent_launch,
+                    window,
+                    cx,
+                )
+            });
+            let close_dashboard = dashboard.clone();
+
+            window.on_window_should_close(cx, move |_, cx| {
                 match close_database
                     .get_close_behavior()
                     .unwrap_or(db::CloseBehavior::HideToTray)
@@ -139,6 +153,9 @@ fn run() -> Result<()> {
                         false
                     }
                     db::CloseBehavior::HideToTray => {
+                        close_dashboard.update(cx, |dashboard, cx| {
+                            dashboard.release_view_data(cx);
+                        });
                         tray::hide_window(close_hwnd.load(Ordering::Relaxed));
                         false
                     }
@@ -149,17 +166,6 @@ fn run() -> Result<()> {
                 }
             });
 
-            let dashboard = cx.new(|cx| {
-                ui::Dashboard::new(
-                    database,
-                    interval_ms,
-                    exit_requested,
-                    target_hwnd,
-                    tracker,
-                    window,
-                    cx,
-                )
-            });
             cx.new(|cx| Root::new(dashboard, window, cx))
         })
         .expect("failed to open IDT window");

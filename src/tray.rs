@@ -12,7 +12,8 @@ use windows::{
         Graphics::Gdi::{
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::Threading::GetCurrentProcess,
+        System::{LibraryLoader::GetModuleHandleW, ProcessStatus::EmptyWorkingSet},
         UI::{
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -22,12 +23,12 @@ use windows::{
                 AdjustWindowRectEx, AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
                 CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
                 GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetMessageW, GetWindowLongW, HMENU,
-                HWND_MESSAGE, IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
-                PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_MINIMIZE, SW_RESTORE,
-                SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
-                TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-                WM_RBUTTONUP, WNDCLASSW,
+                HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING,
+                MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_MINIMIZE,
+                SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+                ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+                WM_NULL, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
@@ -43,6 +44,7 @@ const MENU_EXIT: usize = 1002;
 
 static TARGET_HWND: OnceLock<Arc<AtomicIsize>> = OnceLock::new();
 static EXIT_REQUESTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn start(target_hwnd: Arc<AtomicIsize>, exit_requested: Arc<AtomicBool>) {
     let _ = TARGET_HWND.set(target_hwnd);
@@ -59,6 +61,7 @@ pub fn show_window(hwnd: isize) {
         return;
     }
 
+    SHOW_REQUESTED.store(true, Ordering::Relaxed);
     unsafe {
         let hwnd = HWND(hwnd as _);
         let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -73,6 +76,24 @@ pub fn hide_window(hwnd: isize) {
 
     unsafe {
         let _ = ShowWindow(HWND(hwnd as _), SW_HIDE);
+    }
+}
+
+pub fn is_window_visible(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+
+    unsafe { IsWindowVisible(HWND(hwnd as _)).as_bool() }
+}
+
+pub fn take_show_requested() -> bool {
+    SHOW_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
+pub fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
     }
 }
 

@@ -11,7 +11,9 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+};
 
 use crate::process_icon;
 
@@ -27,6 +29,7 @@ pub const MAX_WINDOW_WIDTH: u32 = 10_000;
 pub const MAX_WINDOW_HEIGHT: u32 = 10_000;
 const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const ARCHIVE_CHECK_INTERVAL_MS: i64 = 60 * 60 * 1_000;
+const APP_TOTAL_ICON_LIMIT: usize = 32;
 
 const MAIN_DB_NAME: &str = "idt.sqlite3";
 const ICON_DB_NAME: &str = "icons.sqlite3";
@@ -173,7 +176,7 @@ pub struct TimelineItem {
     pub duration_ms: u64,
     pub process_name: String,
     pub exe_path: String,
-    pub icon_png: Option<Vec<u8>>,
+    pub icon_png: Option<Arc<[u8]>>,
     pub window_title: String,
     pub window_class: String,
 }
@@ -181,17 +184,32 @@ pub struct TimelineItem {
 #[derive(Clone, Debug)]
 pub struct AppTotal {
     pub process_name: String,
-    pub icon_png: Option<Vec<u8>>,
+    pub exe_path: String,
+    pub icon_png: Option<Arc<[u8]>>,
     pub duration_ms: u64,
     pub percent: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DashboardBucket {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppBucketTotal {
+    pub bucket_ix: usize,
+    pub process_name: String,
+    pub duration_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct DashboardData {
     pub total_ms: u64,
     pub interval_ms: u64,
+    pub record_count: usize,
     pub app_totals: Vec<AppTotal>,
-    pub timeline: Vec<TimelineItem>,
+    pub bucket_totals: Vec<AppBucketTotal>,
 }
 
 #[derive(Clone)]
@@ -425,20 +443,146 @@ impl Database {
         &self,
         range_start_ms: i64,
         range_end_ms: i64,
-        _date_label: impl Into<String>,
+        buckets: &[DashboardBucket],
     ) -> Result<DashboardData> {
         let interval_ms = self.get_interval_ms()?;
-        let sessions = self.load_sessions(range_start_ms, range_end_ms)?;
-        let timeline = clip_sessions(&sessions, range_start_ms, range_end_ms);
-        let total_ms = timeline.iter().map(|item| item.duration_ms).sum::<u64>();
-        let app_totals = app_totals(&timeline, total_ms);
+        let mut total_ms = 0_u64;
+        let mut record_count = 0_usize;
+        let mut app_accumulators = BTreeMap::<String, AppTotalAccumulator>::new();
+        let mut bucket_accumulators = BTreeMap::<(usize, String), u64>::new();
+
+        for conn in self.connect_activity_sources(range_start_ms, range_end_ms)? {
+            let (conn_total_ms, conn_record_count) =
+                dashboard_summary_from_conn(&conn, range_start_ms, range_end_ms)?;
+            total_ms = total_ms.saturating_add(conn_total_ms);
+            record_count = record_count.saturating_add(conn_record_count);
+            merge_app_totals_from_conn(&conn, range_start_ms, range_end_ms, &mut app_accumulators)?;
+            merge_bucket_totals_from_conn(&conn, buckets, &mut bucket_accumulators)?;
+        }
+
+        let mut app_totals = build_app_totals(app_accumulators, total_ms);
+        let icon_count = app_totals.len().min(APP_TOTAL_ICON_LIMIT);
+        self.apply_app_total_icons(&mut app_totals[..icon_count])?;
+        let bucket_totals = bucket_accumulators
+            .into_iter()
+            .map(|((bucket_ix, process_name), duration_ms)| AppBucketTotal {
+                bucket_ix,
+                process_name,
+                duration_ms,
+            })
+            .collect();
 
         Ok(DashboardData {
             total_ms,
             interval_ms,
+            record_count,
             app_totals,
-            timeline,
+            bucket_totals,
         })
+    }
+
+    pub fn timeline_count(
+        &self,
+        range_start_ms: i64,
+        range_end_ms: i64,
+        process_filter: &str,
+        title_filter: &str,
+    ) -> Result<usize> {
+        let filter = TimelineFilter::new(process_filter, title_filter);
+        let mut count = 0_usize;
+        for conn in self.connect_activity_sources(range_start_ms, range_end_ms)? {
+            count = count.saturating_add(timeline_count_from_conn(
+                &conn,
+                range_start_ms,
+                range_end_ms,
+                &filter,
+            )?);
+        }
+        Ok(count)
+    }
+
+    pub fn timeline_page(
+        &self,
+        range_start_ms: i64,
+        range_end_ms: i64,
+        process_filter: &str,
+        title_filter: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<TimelineItem>> {
+        if limit == 0 || range_end_ms <= range_start_ms {
+            return Ok(Vec::new());
+        }
+
+        let filter = TimelineFilter::new(process_filter, title_filter);
+        let archive_paths = self.archive_paths_in_range(range_start_ms, range_end_ms);
+        let conn = self.connect()?;
+        let mut source_names = vec!["main".to_owned()];
+
+        for (ix, path) in archive_paths.iter().enumerate() {
+            let alias = format!("archive_{ix}");
+            conn.execute(
+                &format!("ATTACH DATABASE ?1 AS {alias}"),
+                params![path.display().to_string()],
+            )?;
+            source_names.push(alias);
+        }
+
+        let mut sql_params = Vec::<Value>::new();
+        let selects = source_names
+            .iter()
+            .map(|source_name| {
+                timeline_select_sql(
+                    source_name,
+                    range_start_ms,
+                    range_end_ms,
+                    &filter,
+                    &mut sql_params,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+
+        sql_params.push(Value::Integer(limit.min(i64::MAX as usize) as i64));
+        sql_params.push(Value::Integer(offset.min(i64::MAX as usize) as i64));
+
+        let sql = format!(
+            r#"
+            SELECT
+                started_at_ms,
+                ended_at_ms,
+                duration_ms,
+                process_name,
+                exe_path,
+                window_title,
+                window_class
+            FROM ({selects})
+            ORDER BY started_at_ms DESC, ended_at_ms DESC, sort_id DESC
+            LIMIT ? OFFSET ?
+            "#
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(sql_params), |row| {
+            let started_at_ms = row.get::<_, i64>(0)?;
+            let ended_at_ms = row.get::<_, i64>(1)?;
+            let clipped_start_ms = started_at_ms.max(range_start_ms);
+            let clipped_end_ms = ended_at_ms.min(range_end_ms);
+            Ok(TimelineItem {
+                started_at_ms: clipped_start_ms,
+                ended_at_ms: clipped_end_ms,
+                duration_ms: clipped_end_ms.saturating_sub(clipped_start_ms).max(0) as u64,
+                process_name: row.get(3)?,
+                exe_path: row.get(4)?,
+                window_title: row.get(5)?,
+                window_class: row.get(6)?,
+                icon_png: None,
+            })
+        })?;
+        let mut items = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)?;
+        self.apply_icons(&mut items)?;
+        Ok(items)
     }
 
     fn initialize(&self) -> Result<()> {
@@ -489,37 +633,6 @@ impl Database {
         Ok(conn)
     }
 
-    fn load_sessions(&self, range_start_ms: i64, range_end_ms: i64) -> Result<Vec<TimelineItem>> {
-        let mut sessions = Vec::new();
-        let conn = self.connect()?;
-        sessions.extend(load_sessions_from_conn(
-            &conn,
-            range_start_ms,
-            range_end_ms,
-        )?);
-
-        for (year, month) in months_in_range(range_start_ms, range_end_ms) {
-            let path = self.archive_path(year, month);
-            if !path.exists() {
-                continue;
-            }
-            let archive = connect_path(&path)?;
-            sessions.extend(load_sessions_from_conn(
-                &archive,
-                range_start_ms,
-                range_end_ms,
-            )?);
-        }
-
-        sessions.sort_by(|a, b| {
-            a.started_at_ms
-                .cmp(&b.started_at_ms)
-                .then_with(|| a.ended_at_ms.cmp(&b.ended_at_ms))
-        });
-        self.apply_icons(&mut sessions)?;
-        Ok(sessions)
-    }
-
     fn apply_icons(&self, sessions: &mut [TimelineItem]) -> Result<()> {
         if sessions.is_empty() {
             return Ok(());
@@ -527,7 +640,7 @@ impl Database {
 
         let conn = self.connect_icons()?;
         let mut stmt = conn.prepare("SELECT icon_png FROM process_icons WHERE process_key = ?1")?;
-        let mut icons = BTreeMap::<String, Option<Vec<u8>>>::new();
+        let mut icons = BTreeMap::<String, Option<Arc<[u8]>>>::new();
 
         for item in sessions.iter() {
             let key = process_key_from_parts(&item.process_name, &item.exe_path);
@@ -538,7 +651,8 @@ impl Database {
             let icon_png = stmt
                 .query_row(params![key], |row| row.get::<_, Option<Vec<u8>>>(0))
                 .optional()?
-                .flatten();
+                .flatten()
+                .map(Arc::<[u8]>::from);
             icons.insert(
                 process_key_from_parts(&item.process_name, &item.exe_path),
                 icon_png,
@@ -551,6 +665,57 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn apply_app_total_icons(&self, totals: &mut [AppTotal]) -> Result<()> {
+        if totals.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.connect_icons()?;
+        let mut stmt = conn.prepare("SELECT icon_png FROM process_icons WHERE process_key = ?1")?;
+        let mut icons = BTreeMap::<String, Option<Arc<[u8]>>>::new();
+
+        for total in totals.iter() {
+            let key = process_key_from_parts(&total.process_name, &total.exe_path);
+            if icons.contains_key(&key) {
+                continue;
+            }
+
+            let icon_png = stmt
+                .query_row(params![key], |row| row.get::<_, Option<Vec<u8>>>(0))
+                .optional()?
+                .flatten()
+                .map(Arc::<[u8]>::from);
+            icons.insert(key, icon_png);
+        }
+
+        for total in totals.iter_mut() {
+            let key = process_key_from_parts(&total.process_name, &total.exe_path);
+            total.icon_png = icons.get(&key).cloned().flatten();
+        }
+
+        Ok(())
+    }
+
+    fn connect_activity_sources(
+        &self,
+        range_start_ms: i64,
+        range_end_ms: i64,
+    ) -> Result<Vec<Connection>> {
+        let mut connections = vec![self.connect()?];
+        for path in self.archive_paths_in_range(range_start_ms, range_end_ms) {
+            connections.push(connect_path(&path)?);
+        }
+        Ok(connections)
+    }
+
+    fn archive_paths_in_range(&self, range_start_ms: i64, range_end_ms: i64) -> Vec<PathBuf> {
+        months_in_range(range_start_ms, range_end_ms)
+            .into_iter()
+            .map(|(year, month)| self.archive_path(year, month))
+            .filter(|path| path.exists())
+            .collect()
     }
 
     fn ensure_process_icon(&self, info: &FocusInfo) -> Result<()> {
@@ -932,14 +1097,163 @@ fn parse_window_dimension(value: String, min: u32, max: u32) -> Option<u32> {
         .filter(|dimension| (min..=max).contains(dimension))
 }
 
-fn load_sessions_from_conn(
+#[derive(Default)]
+struct AppTotalAccumulator {
+    duration_ms: u64,
+    icon_exe_path: String,
+    icon_exe_duration_ms: u64,
+}
+
+struct TimelineFilter {
+    process_like: Option<String>,
+    title_like: Option<String>,
+}
+
+impl TimelineFilter {
+    fn new(process_filter: &str, title_filter: &str) -> Self {
+        Self {
+            process_like: like_filter(process_filter),
+            title_like: like_filter(title_filter),
+        }
+    }
+}
+
+fn dashboard_summary_from_conn(
     conn: &Connection,
     range_start_ms: i64,
     range_end_ms: i64,
-) -> Result<Vec<TimelineItem>> {
+) -> Result<(u64, usize)> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
+            COALESCE(SUM(MAX(0, MIN(ended_at_ms, ?2) - MAX(started_at_ms, ?1))), 0),
+            COUNT(*)
+        FROM activity_sessions
+        WHERE ended_at_ms > ?1 AND started_at_ms < ?2
+        "#,
+    )?;
+
+    stmt.query_row(params![range_start_ms, range_end_ms], |row| {
+        Ok((
+            row.get::<_, i64>(0)?.max(0) as u64,
+            row.get::<_, i64>(1)?.max(0) as usize,
+        ))
+    })
+    .map_err(Into::into)
+}
+
+fn merge_app_totals_from_conn(
+    conn: &Connection,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    totals: &mut BTreeMap<String, AppTotalAccumulator>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            process_name,
+            exe_path,
+            SUM(MAX(0, MIN(ended_at_ms, ?2) - MAX(started_at_ms, ?1))) AS clipped_duration_ms
+        FROM activity_sessions
+        WHERE ended_at_ms > ?1 AND started_at_ms < ?2
+        GROUP BY process_name, exe_path
+        HAVING clipped_duration_ms > 0
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![range_start_ms, range_end_ms], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?.max(0) as u64,
+        ))
+    })?;
+
+    for row in rows {
+        let (process_name, exe_path, duration_ms) = row?;
+        let entry = totals.entry(process_name).or_default();
+        entry.duration_ms = entry.duration_ms.saturating_add(duration_ms);
+        if duration_ms > entry.icon_exe_duration_ms {
+            entry.icon_exe_path = exe_path;
+            entry.icon_exe_duration_ms = duration_ms;
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_bucket_totals_from_conn(
+    conn: &Connection,
+    buckets: &[DashboardBucket],
+    totals: &mut BTreeMap<(usize, String), u64>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            process_name,
+            SUM(MAX(0, MIN(ended_at_ms, ?2) - MAX(started_at_ms, ?1))) AS clipped_duration_ms
+        FROM activity_sessions
+        WHERE ended_at_ms > ?1 AND started_at_ms < ?2
+        GROUP BY process_name
+        HAVING clipped_duration_ms > 0
+        "#,
+    )?;
+
+    for (bucket_ix, bucket) in buckets.iter().enumerate() {
+        let rows = stmt.query_map(params![bucket.start_ms, bucket.end_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
+        })?;
+
+        for row in rows {
+            let (process_name, duration_ms) = row?;
+            let entry = totals.entry((bucket_ix, process_name)).or_default();
+            *entry = entry.saturating_add(duration_ms);
+        }
+    }
+
+    Ok(())
+}
+
+fn timeline_count_from_conn(
+    conn: &Connection,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    filter: &TimelineFilter,
+) -> Result<usize> {
+    let mut sql = String::from(
+        r#"
+        SELECT COUNT(*)
+        FROM activity_sessions
+        WHERE ended_at_ms > ? AND started_at_ms < ?
+        "#,
+    );
+    let mut sql_params = vec![Value::Integer(range_start_ms), Value::Integer(range_end_ms)];
+    append_filter_sql(&mut sql, filter, &mut sql_params);
+
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_row(params_from_iter(sql_params), |row| {
+        Ok(row.get::<_, i64>(0)?.max(0) as usize)
+    })
+    .map_err(Into::into)
+}
+
+fn timeline_select_sql(
+    source_name: &str,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    filter: &TimelineFilter,
+    sql_params: &mut Vec<Value>,
+) -> String {
+    sql_params.push(Value::Integer(range_start_ms));
+    sql_params.push(Value::Integer(range_end_ms));
+
+    let mut sql = format!(
+        r#"
+        SELECT
+            id AS sort_id,
             started_at_ms,
             ended_at_ms,
             duration_ms,
@@ -947,28 +1261,71 @@ fn load_sessions_from_conn(
             exe_path,
             window_title,
             window_class
-        FROM activity_sessions
-        WHERE ended_at_ms > ?1 AND started_at_ms < ?2
-        ORDER BY started_at_ms ASC, id ASC
-        "#,
-    )?;
+        FROM {source_name}.activity_sessions
+        WHERE ended_at_ms > ? AND started_at_ms < ?
+        "#
+    );
+    append_filter_sql(&mut sql, filter, sql_params);
+    sql
+}
 
-    let rows = stmt.query_map(params![range_start_ms, range_end_ms], |row| {
-        let duration_ms = row.get::<_, i64>(2)?.max(0) as u64;
-        Ok(TimelineItem {
-            started_at_ms: row.get(0)?,
-            ended_at_ms: row.get(1)?,
-            duration_ms,
-            process_name: row.get(3)?,
-            exe_path: row.get(4)?,
-            window_title: row.get(5)?,
-            window_class: row.get(6)?,
-            icon_png: None,
+fn append_filter_sql(sql: &mut String, filter: &TimelineFilter, sql_params: &mut Vec<Value>) {
+    if let Some(process_like) = filter.process_like.as_ref() {
+        sql.push_str(" AND LOWER(process_name) LIKE ? ESCAPE '\\'");
+        sql_params.push(Value::Text(process_like.clone()));
+    }
+    if let Some(title_like) = filter.title_like.as_ref() {
+        sql.push_str(" AND LOWER(window_title) LIKE ? ESCAPE '\\'");
+        sql_params.push(Value::Text(title_like.clone()));
+    }
+}
+
+fn like_filter(value: &str) -> Option<String> {
+    let value = value.trim().to_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('%');
+    for ch in value.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('%');
+    Some(escaped)
+}
+
+fn build_app_totals(totals: BTreeMap<String, AppTotalAccumulator>, total_ms: u64) -> Vec<AppTotal> {
+    let mut totals = totals
+        .into_iter()
+        .map(|(process_name, accumulator)| {
+            let percent = if total_ms == 0 {
+                0.0
+            } else {
+                accumulator.duration_ms as f32 / total_ms as f32
+            };
+            AppTotal {
+                process_name,
+                exe_path: accumulator.icon_exe_path,
+                icon_png: None,
+                duration_ms: accumulator.duration_ms,
+                percent,
+            }
         })
-    })?;
+        .collect::<Vec<_>>();
 
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    totals.sort_by(|a, b| {
+        b.duration_ms
+            .cmp(&a.duration_ms)
+            .then_with(|| a.process_name.cmp(&b.process_name))
+    });
+    totals
 }
 
 fn load_archive_candidates(conn: &Connection, cutoff_ms: i64) -> Result<Vec<SessionRecord>> {
@@ -1120,65 +1477,58 @@ fn next_month(date: NaiveDate) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, 1).expect("valid next month")
 }
 
-fn clip_sessions(
-    sessions: &[TimelineItem],
-    day_start_ms: i64,
-    day_end_ms: i64,
-) -> Vec<TimelineItem> {
-    sessions
-        .iter()
-        .filter_map(|item| {
-            let started_at_ms = item.started_at_ms.max(day_start_ms);
-            let ended_at_ms = item.ended_at_ms.min(day_end_ms);
-            if ended_at_ms <= started_at_ms {
-                return None;
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            Some(TimelineItem {
-                started_at_ms,
-                ended_at_ms,
-                duration_ms: ended_at_ms.saturating_sub(started_at_ms) as u64,
-                process_name: item.process_name.clone(),
-                exe_path: item.exe_path.clone(),
-                icon_png: item.icon_png.clone(),
-                window_title: item.window_title.clone(),
-                window_class: item.window_class.clone(),
-            })
-        })
-        .collect()
-}
+    #[test]
+    fn timeline_count_and_page_return_matching_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "idt-db-test-{}-{}",
+            std::process::id(),
+            Database::now_ms()
+        ));
+        let database = Database::open(&dir).expect("test database should open");
+        let base_ms = Database::now_ms().saturating_sub(60_000);
 
-fn app_totals(timeline: &[TimelineItem], total_ms: u64) -> Vec<AppTotal> {
-    let mut totals = BTreeMap::<String, (u64, Option<Vec<u8>>)>::new();
-    for item in timeline {
-        let entry = totals.entry(item.process_name.clone()).or_default();
-        entry.0 += item.duration_ms;
-        if entry.1.is_none() {
-            entry.1 = item.icon_png.clone();
-        }
+        let alpha = test_focus_info("alpha.exe", "Alpha Window");
+        let beta = test_focus_info("beta.exe", "Beta Window");
+        database
+            .append_usage(&alpha, base_ms, base_ms + 10_000)
+            .expect("alpha usage should insert");
+        database
+            .append_usage(&beta, base_ms + 20_000, base_ms + 30_000)
+            .expect("beta usage should insert");
+
+        let count = database
+            .timeline_count(base_ms - 1_000, base_ms + 31_000, "", "")
+            .expect("timeline count should query");
+        assert_eq!(count, 2);
+
+        let page = database
+            .timeline_page(base_ms - 1_000, base_ms + 31_000, "", "", 0, 10)
+            .expect("timeline page should query");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].process_name, "beta.exe");
+        assert_eq!(page[1].process_name, "alpha.exe");
+
+        let filtered = database
+            .timeline_page(base_ms - 1_000, base_ms + 31_000, "alpha", "window", 0, 10)
+            .expect("filtered timeline page should query");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].process_name, "alpha.exe");
+
+        drop(database);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    let mut totals = totals
-        .into_iter()
-        .map(|(process_name, (duration_ms, icon_png))| {
-            let percent = if total_ms == 0 {
-                0.0
-            } else {
-                duration_ms as f32 / total_ms as f32
-            };
-            AppTotal {
-                process_name,
-                icon_png,
-                duration_ms,
-                percent,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    totals.sort_by(|a, b| {
-        b.duration_ms
-            .cmp(&a.duration_ms)
-            .then_with(|| a.process_name.cmp(&b.process_name))
-    });
-    totals
+    fn test_focus_info(process_name: &str, window_title: &str) -> FocusInfo {
+        FocusInfo {
+            process_id: 1,
+            process_name: process_name.to_owned(),
+            exe_path: String::new(),
+            window_class: "TestWindow".to_owned(),
+            window_title: window_title.to_owned(),
+        }
+    }
 }

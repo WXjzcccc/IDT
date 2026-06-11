@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    rc::Rc,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
@@ -12,13 +12,12 @@ use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, Hsla, Image, ImageFormat,
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Pixels, Render,
-    SharedString, Size as GpuiSize, Styled as _, StyledImage as _, Subscription, Window,
+    SharedString, Styled as _, StyledImage as _, Subscription, UniformListScrollHandle, Window,
     WindowControlArea, div, img, linear_color_stop, linear_gradient, prelude::FluentBuilder as _,
-    px, relative, size,
+    px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, PixelsExt as _, Selectable as _, Sizable as _, Theme, ThemeMode,
-    VirtualListScrollHandle,
     button::{Button, ButtonVariants as _},
     calendar::Date,
     chart::AreaChart,
@@ -27,14 +26,14 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
     switch::Switch,
-    v_flex, v_virtual_list,
+    v_flex,
 };
 use smol::Timer;
 
 use crate::{
     db::{
-        AppTotal, CloseBehavior, DEFAULT_INTERVAL_MS, DashboardData, Database, ThemePreference,
-        TimelineItem, WindowSize,
+        AppTotal, CloseBehavior, DEFAULT_INTERVAL_MS, DashboardBucket, DashboardData, Database,
+        ThemePreference, TimelineItem, WindowSize,
     },
     startup,
     tracker::TrackerHandle,
@@ -43,6 +42,7 @@ use crate::{
 
 const INTERVAL_PRESETS: [u64; 5] = [200, 500, 1_000, 3_000, 5_000];
 const TIMELINE_ROW_HEIGHT: f32 = 58.0;
+const TIMELINE_PAGE_SIZE: usize = 1000;
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
@@ -66,7 +66,6 @@ enum TimeFilter {
 struct TimeRange {
     start_ms: i64,
     end_ms: i64,
-    label: String,
 }
 
 #[derive(Clone)]
@@ -78,7 +77,7 @@ struct AppAreaPoint {
 #[derive(Clone)]
 struct AppGroup {
     process_name: String,
-    icon_png: Option<Vec<u8>>,
+    icon_png: Option<Arc<[u8]>>,
     duration_ms: u64,
     percent: f32,
     processes: Vec<String>,
@@ -90,6 +89,14 @@ struct ChartBucket {
     start_ms: i64,
     end_ms: i64,
     label: SharedString,
+}
+
+#[derive(Default)]
+struct TimelineCache {
+    start: usize,
+    items: Vec<TimelineItem>,
+    process_filter: String,
+    title_filter: String,
 }
 
 pub struct Dashboard {
@@ -105,11 +112,13 @@ pub struct Dashboard {
     range_picker: Entity<DatePickerState>,
     process_filter_input: Entity<InputState>,
     title_filter_input: Entity<InputState>,
-    timeline_indices: Rc<Vec<usize>>,
-    timeline_row_sizes: Rc<Vec<GpuiSize<Pixels>>>,
-    timeline_scroll: VirtualListScrollHandle,
+    timeline_count: usize,
+    timeline_cache: TimelineCache,
+    timeline_scroll: UniformListScrollHandle,
     window_width: f32,
     window_height: f32,
+    sleeping_to_tray: bool,
+    data_loaded: bool,
     last_saved_window_size: Option<WindowSize>,
     theme: ThemePreference,
     autostart_enabled: bool,
@@ -127,6 +136,7 @@ impl Dashboard {
         exit_requested: Arc<AtomicBool>,
         target_hwnd: Arc<AtomicIsize>,
         tracker: TrackerHandle,
+        start_hidden: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -173,36 +183,50 @@ impl Dashboard {
                     view.time_filter = TimeFilter::Custom;
                     view.custom_range = (start, end);
                     view.sync_range_picker(window, cx);
-                    view.refresh(cx);
+                    view.refresh_from_interaction(cx);
                 }
             }),
             cx.subscribe_in(&process_filter_input, window, |view, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    view.rebuild_timeline_filter(cx);
+                    view.refresh_timeline_count(cx);
                 }
             }),
             cx.subscribe_in(&title_filter_input, window, |view, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    view.rebuild_timeline_filter(cx);
+                    view.refresh_timeline_count(cx);
                 }
             }),
         ];
 
-        let data = database
-            .dashboard_range(
-                time_range.start_ms,
-                time_range.end_ms,
-                time_range.label.clone(),
+        let (data, timeline_count) = if start_hidden {
+            (
+                empty_dashboard(database.get_interval_ms().unwrap_or(DEFAULT_INTERVAL_MS)),
+                0,
             )
-            .unwrap_or_else(|error| {
-                eprintln!("failed to load dashboard data: {error:#}");
-                empty_dashboard(DEFAULT_INTERVAL_MS)
-            });
-        let timeline_indices = filtered_timeline_indices(
-            &data.timeline,
-            process_filter_input.read(cx).value().as_ref(),
-            title_filter_input.read(cx).value().as_ref(),
-        );
+        } else {
+            let data = database
+                .dashboard_range(
+                    time_range.start_ms,
+                    time_range.end_ms,
+                    &dashboard_buckets(&time_range),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to load dashboard data: {error:#}");
+                    empty_dashboard(DEFAULT_INTERVAL_MS)
+                });
+            let timeline_count = database
+                .timeline_count(
+                    time_range.start_ms,
+                    time_range.end_ms,
+                    process_filter_input.read(cx).value().as_ref(),
+                    title_filter_input.read(cx).value().as_ref(),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to count timeline data: {error:#}");
+                    0
+                });
+            (data, timeline_count)
+        };
 
         let dashboard = Self {
             database,
@@ -216,11 +240,13 @@ impl Dashboard {
             range_picker,
             process_filter_input,
             title_filter_input,
-            timeline_row_sizes: timeline_row_sizes(timeline_indices.len()),
-            timeline_indices: Rc::new(timeline_indices),
-            timeline_scroll: VirtualListScrollHandle::new(),
+            timeline_count,
+            timeline_cache: TimelineCache::default(),
+            timeline_scroll: UniformListScrollHandle::new(),
             window_width: crate::db::DEFAULT_WINDOW_WIDTH as f32,
             window_height: crate::db::DEFAULT_WINDOW_HEIGHT as f32,
+            sleeping_to_tray: start_hidden,
+            data_loaded: !start_hidden,
             last_saved_window_size,
             theme: settings.theme,
             autostart_enabled,
@@ -228,7 +254,11 @@ impl Dashboard {
             close_behavior: settings.close_behavior,
             data,
             mode: ViewMode::Overview,
-            status: "运行中".to_owned(),
+            status: if start_hidden {
+                "后台运行中".to_owned()
+            } else {
+                "运行中".to_owned()
+            },
             _subscriptions: subscriptions,
         };
         dashboard.spawn_refresh(cx);
@@ -250,7 +280,7 @@ impl Dashboard {
                             cx.quit();
                             return false;
                         }
-                        view.refresh(cx);
+                        view.refresh_visible(cx);
                         true
                     })
                     .unwrap_or(false);
@@ -263,18 +293,38 @@ impl Dashboard {
         .detach();
     }
 
+    fn refresh_visible(&mut self, cx: &mut Context<Self>) {
+        let show_requested = tray::take_show_requested();
+        if self.sleeping_to_tray {
+            let visible = tray::is_window_visible(self.target_hwnd.load(Ordering::Relaxed));
+            if !show_requested && !visible {
+                return;
+            }
+            self.sleeping_to_tray = false;
+        }
+
+        self.refresh(cx);
+    }
+
+    fn refresh_from_interaction(&mut self, cx: &mut Context<Self>) {
+        self.sleeping_to_tray = false;
+        self.refresh(cx);
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let time_range = self.time_filter.range(self.custom_range);
         match self.database.dashboard_range(
             time_range.start_ms,
             time_range.end_ms,
-            time_range.label.clone(),
+            &dashboard_buckets(&time_range),
         ) {
             Ok(data) => {
                 self.time_range = time_range;
                 self.data = data;
-                self.rebuild_timeline_filter(cx);
-                self.status = "运行中".to_owned();
+                self.data_loaded = true;
+                if self.update_timeline_count(cx).is_ok() {
+                    self.status = "运行中".to_owned();
+                }
             }
             Err(error) => {
                 self.status = format!("读取失败: {error}");
@@ -287,7 +337,7 @@ impl Dashboard {
         self.time_filter = filter;
         self.time_range = self.time_filter.range(self.custom_range);
         self.sync_range_picker(window, cx);
-        self.refresh(cx);
+        self.refresh_from_interaction(cx);
     }
 
     fn sync_range_picker(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -297,13 +347,80 @@ impl Dashboard {
         });
     }
 
-    fn rebuild_timeline_filter(&mut self, cx: &mut Context<Self>) {
+    fn refresh_timeline_count(&mut self, cx: &mut Context<Self>) {
+        self.sleeping_to_tray = false;
+        if !self.data_loaded {
+            self.refresh(cx);
+            return;
+        }
+
+        let _ = self.update_timeline_count(cx);
+        cx.notify();
+    }
+
+    fn update_timeline_count(&mut self, cx: &mut Context<Self>) -> Result<(), ()> {
         let process_filter = self.process_filter_input.read(cx).value();
         let title_filter = self.title_filter_input.read(cx).value();
-        let indices =
-            filtered_timeline_indices(&self.data.timeline, &process_filter, &title_filter);
-        self.timeline_row_sizes = timeline_row_sizes(indices.len());
-        self.timeline_indices = Rc::new(indices);
+        match self.database.timeline_count(
+            self.time_range.start_ms,
+            self.time_range.end_ms,
+            &process_filter,
+            &title_filter,
+        ) {
+            Ok(count) => {
+                self.timeline_count = count;
+                self.timeline_cache = TimelineCache::default();
+                if self.mode == ViewMode::Timeline {
+                    self.load_timeline_cache_for_current_filter(0, cx);
+                }
+            }
+            Err(error) => {
+                self.timeline_count = 0;
+                self.timeline_cache = TimelineCache::default();
+                self.status = format!("读取失败: {error}");
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    fn preload_timeline_first_page(&mut self, cx: &mut Context<Self>) {
+        if self.timeline_count == 0 {
+            self.timeline_cache = TimelineCache::default();
+            cx.notify();
+            return;
+        }
+
+        let process_filter = self.process_filter_input.read(cx).value().to_string();
+        let title_filter = self.title_filter_input.read(cx).value().to_string();
+        if !self.timeline_cache_contains(0, &process_filter, &title_filter) {
+            self.load_timeline_cache_with_filters(0, process_filter, title_filter, cx);
+            return;
+        }
+
+        cx.notify();
+    }
+
+    fn load_timeline_cache_for_current_filter(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let process_filter = self.process_filter_input.read(cx).value().to_string();
+        let title_filter = self.title_filter_input.read(cx).value().to_string();
+        self.load_timeline_cache_with_filters(offset, process_filter, title_filter, cx);
+    }
+
+    pub fn release_view_data(&mut self, cx: &mut Context<Self>) {
+        self.sleeping_to_tray = true;
+        if !self.data_loaded && self.timeline_cache.items.is_empty() {
+            self.status = "后台运行中".to_owned();
+            return;
+        }
+
+        let interval_ms = self.data.interval_ms;
+        self.data = empty_dashboard(interval_ms);
+        self.timeline_count = 0;
+        self.timeline_cache = TimelineCache::default();
+        self.data_loaded = false;
+        self.status = "后台运行中".to_owned();
+        tray::trim_working_set();
         cx.notify();
     }
 
@@ -512,6 +629,7 @@ impl Dashboard {
                 tray::minimize_window(self.target_hwnd.load(Ordering::Relaxed));
             }
             CloseBehavior::HideToTray => {
+                self.release_view_data(cx);
                 tray::hide_window(self.target_hwnd.load(Ordering::Relaxed));
             }
             CloseBehavior::Exit => {
@@ -585,6 +703,14 @@ impl Dashboard {
             .selected(self.mode == mode)
             .on_click(cx.listener(move |view, _, _, cx| {
                 view.mode = mode;
+                if !view.data_loaded && mode != ViewMode::Settings {
+                    view.refresh_from_interaction(cx);
+                    return;
+                }
+                if mode == ViewMode::Timeline {
+                    view.preload_timeline_first_page(cx);
+                    return;
+                }
                 cx.notify();
             }))
     }
@@ -656,7 +782,7 @@ impl Dashboard {
                     .gap_3()
                     .child(self.render_metric("总时长", format_duration(self.data.total_ms), cx))
                     .child(self.render_metric("应用数量", app_count.to_string(), cx))
-                    .child(self.render_metric("记录数", self.data.timeline.len().to_string(), cx)),
+                    .child(self.render_metric("记录数", self.data.record_count.to_string(), cx)),
             )
             .child(
                 h_flex()
@@ -675,9 +801,8 @@ impl Dashboard {
     }
 
     fn render_timeline_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let item_sizes = self.timeline_row_sizes.clone();
-        let item_indices = self.timeline_indices.clone();
-        let body = if self.timeline_indices.is_empty() {
+        let item_count = self.timeline_count;
+        let body = if item_count == 0 {
             div()
                 .relative()
                 .flex_1()
@@ -691,28 +816,26 @@ impl Dashboard {
             div()
                 .relative()
                 .flex_1()
+                .min_h(px(0.))
                 .child(
-                    v_virtual_list(
-                        cx.entity().clone(),
+                    uniform_list(
                         "timeline-virtual-list",
-                        item_sizes,
-                        move |view, visible_range, _, cx| {
-                            let total = item_indices.len();
+                        item_count,
+                        cx.processor(move |view, visible_range: Range<usize>, _, cx| {
                             visible_range
-                                .filter_map(|row_ix| {
-                                    let visible_ix = total.checked_sub(row_ix + 1)?;
-                                    let item_ix = *item_indices.get(visible_ix)?;
-                                    let item = view.data.timeline.get(item_ix)?.clone();
-                                    Some(
-                                        view.render_timeline_row(row_ix, &item, cx)
+                                .map(|row_ix| {
+                                    match view.timeline_item_for_row(row_ix, item_count, cx) {
+                                        Some(item) => view
+                                            .render_timeline_row(row_ix, &item, cx)
                                             .into_any_element(),
-                                    )
+                                        None => view.render_loading_timeline_row(row_ix, cx),
+                                    }
                                 })
                                 .collect::<Vec<_>>()
-                        },
+                        }),
                     )
-                    .track_scroll(&self.timeline_scroll)
-                    .flex_1(),
+                    .size_full()
+                    .track_scroll(self.timeline_scroll.clone()),
                 )
                 .vertical_scrollbar(&self.timeline_scroll)
                 .into_any_element()
@@ -953,7 +1076,7 @@ impl Dashboard {
 
     fn render_usage_chart(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let app_groups = self.grouped_app_totals();
-        let chart_data = app_area_points(&self.data.timeline, &app_groups, &self.time_range);
+        let chart_data = app_area_points(&self.data, &app_groups, &self.time_range);
         let tick_margin = (chart_data.len() / 6).max(1);
         let mut chart = AreaChart::new(chart_data)
             .x(|point: &AppAreaPoint| point.label.clone())
@@ -1251,6 +1374,99 @@ impl Dashboard {
             )
     }
 
+    fn render_loading_timeline_row(&self, row_ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let row_bg = if row_ix % 2 == 0 {
+            cx.theme().background
+        } else {
+            cx.theme().muted.opacity(0.18)
+        };
+
+        h_flex()
+            .w_full()
+            .h(px(TIMELINE_ROW_HEIGHT))
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border.opacity(0.28))
+            .bg(row_bg)
+            .px_3()
+            .text_color(cx.theme().muted_foreground)
+            .child("加载中")
+            .into_any_element()
+    }
+
+    fn timeline_item_for_row(
+        &mut self,
+        row_ix: usize,
+        total_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<TimelineItem> {
+        if row_ix >= total_count {
+            return None;
+        }
+        let offset = row_ix;
+        let process_filter = self.process_filter_input.read(cx).value().to_string();
+        let title_filter = self.title_filter_input.read(cx).value().to_string();
+        if !self.timeline_cache_contains(offset, &process_filter, &title_filter) {
+            self.load_timeline_cache_with_filters(offset, process_filter, title_filter, cx);
+        }
+
+        self.timeline_cache
+            .items
+            .get(offset.saturating_sub(self.timeline_cache.start))
+            .cloned()
+    }
+
+    fn timeline_cache_contains(
+        &self,
+        offset: usize,
+        process_filter: &str,
+        title_filter: &str,
+    ) -> bool {
+        offset >= self.timeline_cache.start
+            && offset
+                < self
+                    .timeline_cache
+                    .start
+                    .saturating_add(self.timeline_cache.items.len())
+            && self.timeline_cache.process_filter == process_filter
+            && self.timeline_cache.title_filter == title_filter
+    }
+
+    fn load_timeline_cache_with_filters(
+        &mut self,
+        offset: usize,
+        process_filter: String,
+        title_filter: String,
+        cx: &mut Context<Self>,
+    ) {
+        let start = offset.saturating_sub(TIMELINE_PAGE_SIZE / 4);
+        let limit = TIMELINE_PAGE_SIZE.min(self.timeline_count.saturating_sub(start));
+
+        match self.database.timeline_page(
+            self.time_range.start_ms,
+            self.time_range.end_ms,
+            &process_filter,
+            &title_filter,
+            start,
+            limit,
+        ) {
+            Ok(items) => {
+                self.timeline_cache = TimelineCache {
+                    start,
+                    items,
+                    process_filter,
+                    title_filter,
+                };
+            }
+            Err(error) => {
+                self.timeline_cache = TimelineCache::default();
+                self.status = format!("读取失败: {error}");
+            }
+        }
+
+        cx.notify();
+    }
+
     fn render_process_icon(
         &self,
         process_name: &str,
@@ -1342,14 +1558,6 @@ impl Render for Dashboard {
     }
 }
 
-fn timeline_row_sizes(count: usize) -> Rc<Vec<GpuiSize<Pixels>>> {
-    Rc::new(
-        (0..count)
-            .map(|_| size(px(1_160.), px(TIMELINE_ROW_HEIGHT)))
-            .collect(),
-    )
-}
-
 fn timeline_head_cell(label: &'static str, width: Pixels) -> gpui::Div {
     div()
         .w(width)
@@ -1378,19 +1586,11 @@ impl TimeFilter {
             Self::Last24Hours => {
                 let end_ms = now.timestamp_millis();
                 let start_ms = end_ms.saturating_sub(DAY_MS);
-                TimeRange {
-                    start_ms,
-                    end_ms,
-                    label: "最近24小时".to_owned(),
-                }
+                TimeRange { start_ms, end_ms }
             }
             Self::Today => {
                 let (start_ms, end_ms) = day_bounds(today);
-                TimeRange {
-                    start_ms,
-                    end_ms,
-                    label: today.format("%Y-%m-%d").to_string(),
-                }
+                TimeRange { start_ms, end_ms }
             }
             Self::ThisWeek => {
                 let start =
@@ -1399,11 +1599,6 @@ impl TimeFilter {
                 TimeRange {
                     start_ms: local_midnight_ms(start),
                     end_ms: local_midnight_ms(end),
-                    label: format!(
-                        "{} - {}",
-                        start.format("%Y-%m-%d"),
-                        (end - ChronoDuration::days(1)).format("%Y-%m-%d")
-                    ),
                 }
             }
             Self::ThisMonth => {
@@ -1418,7 +1613,6 @@ impl TimeFilter {
                 TimeRange {
                     start_ms: local_midnight_ms(start),
                     end_ms: local_midnight_ms(end),
-                    label: start.format("%Y-%m").to_string(),
                 }
             }
             Self::Custom => {
@@ -1427,7 +1621,6 @@ impl TimeFilter {
                 TimeRange {
                     start_ms: local_midnight_ms(start),
                     end_ms: local_midnight_ms(range_end),
-                    label: format!("{} - {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d")),
                 }
             }
         }
@@ -1486,28 +1679,6 @@ fn local_midnight_ms(date: NaiveDate) -> i64 {
         .timestamp_millis()
 }
 
-fn filtered_timeline_indices(
-    timeline: &[TimelineItem],
-    process_filter: &str,
-    title_filter: &str,
-) -> Vec<usize> {
-    let process_filter = process_filter.trim().to_lowercase();
-    let title_filter = title_filter.trim().to_lowercase();
-
-    timeline
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, item)| {
-            let process_matches = process_filter.is_empty()
-                || item.process_name.to_lowercase().contains(&process_filter);
-            let title_matches =
-                title_filter.is_empty() || item.window_title.to_lowercase().contains(&title_filter);
-
-            (process_matches && title_matches).then_some(ix)
-        })
-        .collect()
-}
-
 fn group_app_totals(app_totals: &[AppTotal], total_ms: u64, display_count: usize) -> Vec<AppGroup> {
     let display_count = display_count.max(1);
     let visible_count = app_totals.len().min(display_count);
@@ -1551,7 +1722,7 @@ fn group_app_totals(app_totals: &[AppTotal], total_ms: u64, display_count: usize
 }
 
 fn app_area_points(
-    timeline: &[TimelineItem],
+    data: &DashboardData,
     groups: &[AppGroup],
     time_range: &TimeRange,
 ) -> Vec<AppAreaPoint> {
@@ -1572,18 +1743,12 @@ fn app_area_points(
         .collect::<HashMap<_, _>>();
 
     let mut values = vec![vec![0_f64; groups.len()]; buckets.len()];
-    for item in timeline {
-        let Some(group_ix) = group_lookup.get(&item.process_name).copied() else {
+    for total in &data.bucket_totals {
+        let Some(group_ix) = group_lookup.get(&total.process_name).copied() else {
             continue;
         };
-
-        for (bucket_ix, bucket) in buckets.iter().enumerate() {
-            let overlap_start = item.started_at_ms.max(bucket.start_ms);
-            let overlap_end = item.ended_at_ms.min(bucket.end_ms);
-            if overlap_end > overlap_start {
-                values[bucket_ix][group_ix] +=
-                    overlap_end.saturating_sub(overlap_start) as f64 / 60_000.0;
-            }
+        if let Some(bucket) = values.get_mut(total.bucket_ix) {
+            bucket[group_ix] += total.duration_ms as f64 / 60_000.0;
         }
     }
 
@@ -1595,6 +1760,16 @@ fn app_area_points(
         .map(|(ix, bucket)| AppAreaPoint {
             label: bucket.label,
             values: values.get(ix).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn dashboard_buckets(time_range: &TimeRange) -> Vec<DashboardBucket> {
+    chart_buckets(time_range)
+        .into_iter()
+        .map(|bucket| DashboardBucket {
+            start_ms: bucket.start_ms,
+            end_ms: bucket.end_ms,
         })
         .collect()
 }
@@ -1716,8 +1891,9 @@ fn empty_dashboard(interval_ms: u64) -> DashboardData {
     DashboardData {
         total_ms: 0,
         interval_ms,
+        record_count: 0,
         app_totals: Vec::new(),
-        timeline: Vec::new(),
+        bucket_totals: Vec::new(),
     }
 }
 
