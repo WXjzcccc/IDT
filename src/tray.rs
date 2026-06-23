@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicIsize, Ordering},
     },
     thread,
@@ -9,9 +9,6 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Graphics::Gdi::{
-            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
-        },
         System::Threading::GetCurrentProcess,
         System::{LibraryLoader::GetModuleHandleW, ProcessStatus::EmptyWorkingSet},
         UI::{
@@ -20,22 +17,21 @@ use windows::{
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AdjustWindowRectEx, AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-                CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-                GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetMessageW, GetWindowLongW, HMENU,
-                HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING,
-                MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_MINIMIZE,
-                SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-                ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-                WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+                AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu,
+                CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
+                GetMessageW, GetWindowRect, HMENU, HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible,
+                LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+                RegisterClassW, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER,
+                SetForegroundWindow, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+                WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
     core::w,
 };
 
-use crate::{app_icon, db::WindowSize};
+use crate::app_icon;
 
 const TRAY_UID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 17;
@@ -45,6 +41,7 @@ const MENU_EXIT: usize = 1002;
 static TARGET_HWND: OnceLock<Arc<AtomicIsize>> = OnceLock::new();
 static EXIT_REQUESTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+static LAST_WINDOW_RECT: OnceLock<Mutex<Option<StoredWindowRect>>> = OnceLock::new();
 
 pub fn start(target_hwnd: Arc<AtomicIsize>, exit_requested: Arc<AtomicBool>) {
     let _ = TARGET_HWND.set(target_hwnd);
@@ -64,6 +61,7 @@ pub fn show_window(hwnd: isize) {
     SHOW_REQUESTED.store(true, Ordering::Relaxed);
     unsafe {
         let hwnd = HWND(hwnd as _);
+        restore_last_window_position(hwnd);
         let _ = ShowWindow(hwnd, SW_RESTORE);
         let _ = SetForegroundWindow(hwnd);
     }
@@ -74,6 +72,7 @@ pub fn hide_window(hwnd: isize) {
         return;
     }
 
+    remember_window_position(hwnd);
     unsafe {
         let _ = ShowWindow(HWND(hwnd as _), SW_HIDE);
     }
@@ -102,57 +101,75 @@ pub fn minimize_window(hwnd: isize) {
         return;
     }
 
+    remember_window_position(hwnd);
     unsafe {
         let _ = ShowWindow(HWND(hwnd as _), SW_MINIMIZE);
     }
 }
+#[derive(Clone, Copy)]
+struct StoredWindowRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
 
-pub fn center_window(hwnd: isize, window_size: WindowSize) {
+pub fn remember_window_position(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
 
     unsafe {
-        let hwnd = HWND(hwnd as _);
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut monitor_info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+        let mut rect = RECT::default();
+        if GetWindowRect(HWND(hwnd as _), &mut rect).is_err() {
             return;
         }
 
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: window_size.width as i32,
-            bottom: window_size.height as i32,
-        };
-        let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
-        let ex_style = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
-        if AdjustWindowRectEx(&mut rect, style, false, ex_style).is_err() {
+        if rect.right <= rect.left || rect.bottom <= rect.top {
             return;
         }
 
-        let window_width = rect.right - rect.left;
-        let window_height = rect.bottom - rect.top;
-        let work_area = monitor_info.rcWork;
-        let work_width = work_area.right - work_area.left;
-        let work_height = work_area.bottom - work_area.top;
-        let x = work_area.left + (work_width - window_width).max(0) / 2;
-        let y = work_area.top + (work_height - window_height).max(0) / 2;
+        let mut last_rect = last_window_rect()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *last_rect = Some(StoredWindowRect {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        });
+    }
+}
 
+fn restore_last_window_position(hwnd: HWND) {
+    let rect = *last_window_rect()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(rect) = rect else {
+        return;
+    };
+
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    unsafe {
         let _ = SetWindowPos(
             hwnd,
             None,
-            x,
-            y,
-            window_width,
-            window_height,
+            rect.left,
+            rect.top,
+            width,
+            height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
+}
+
+fn last_window_rect() -> &'static Mutex<Option<StoredWindowRect>> {
+    LAST_WINDOW_RECT.get_or_init(|| Mutex::new(None))
 }
 
 fn run_tray_loop() {

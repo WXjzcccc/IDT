@@ -41,6 +41,7 @@ use crate::{
 };
 
 const INTERVAL_PRESETS: [u64; 5] = [200, 500, 1_000, 3_000, 5_000];
+const CACHE_FLUSH_PRESETS: [u64; 4] = [5_000, 10_000, 30_000, 60_000];
 const TIMELINE_ROW_HEIGHT: f32 = 58.0;
 const TIMELINE_PAGE_SIZE: usize = 1000;
 const HOUR_MS: i64 = 60 * 60 * 1_000;
@@ -102,6 +103,7 @@ struct TimelineCache {
 pub struct Dashboard {
     database: Database,
     interval_ms: Arc<AtomicU64>,
+    cache_flush_interval_ms: Arc<AtomicU64>,
     exit_requested: Arc<AtomicBool>,
     target_hwnd: Arc<AtomicIsize>,
     _tracker: TrackerHandle,
@@ -124,6 +126,7 @@ pub struct Dashboard {
     autostart_enabled: bool,
     silent_start: bool,
     close_behavior: CloseBehavior,
+    cache_flush_interval_value_ms: u64,
     mode: ViewMode,
     status: String,
     _subscriptions: Vec<Subscription>,
@@ -133,6 +136,7 @@ impl Dashboard {
     pub fn new(
         database: Database,
         interval_ms: Arc<AtomicU64>,
+        cache_flush_interval_ms: Arc<AtomicU64>,
         exit_requested: Arc<AtomicBool>,
         target_hwnd: Arc<AtomicIsize>,
         tracker: TrackerHandle,
@@ -151,6 +155,7 @@ impl Dashboard {
                 autostart_enabled: false,
                 silent_start: false,
                 close_behavior: CloseBehavior::HideToTray,
+                cache_flush_interval_ms: crate::db::DEFAULT_CACHE_FLUSH_INTERVAL_MS,
             }
         });
         let autostart_enabled = startup::is_enabled().unwrap_or(settings.autostart_enabled);
@@ -231,6 +236,7 @@ impl Dashboard {
         let dashboard = Self {
             database,
             interval_ms,
+            cache_flush_interval_ms,
             exit_requested,
             target_hwnd,
             _tracker: tracker,
@@ -252,6 +258,7 @@ impl Dashboard {
             autostart_enabled,
             silent_start: settings.silent_start,
             close_behavior: settings.close_behavior,
+            cache_flush_interval_value_ms: settings.cache_flush_interval_ms,
             data,
             mode: ViewMode::Overview,
             status: if start_hidden {
@@ -301,6 +308,10 @@ impl Dashboard {
                 return;
             }
             self.sleeping_to_tray = false;
+        }
+
+        if self.mode == ViewMode::Settings {
+            return;
         }
 
         self.refresh(cx);
@@ -454,6 +465,21 @@ impl Dashboard {
                 self.interval_ms.store(interval_ms, Ordering::Relaxed);
                 self.data.interval_ms = interval_ms;
                 self.status = format!("采样间隔已设为 {}", format_interval(interval_ms));
+            }
+            Err(error) => {
+                self.status = format!("保存失败: {error}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_cache_flush_interval(&mut self, interval_ms: u64, cx: &mut Context<Self>) {
+        match self.database.set_cache_flush_interval_ms(interval_ms) {
+            Ok(interval_ms) => {
+                self.cache_flush_interval_ms
+                    .store(interval_ms, Ordering::Relaxed);
+                self.cache_flush_interval_value_ms = interval_ms;
+                self.status = format!("缓存写入周期已设为 {}", format_interval(interval_ms));
             }
             Err(error) => {
                 self.status = format!("保存失败: {error}");
@@ -921,6 +947,19 @@ impl Dashboard {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+        let cache_flush_buttons = CACHE_FLUSH_PRESETS
+            .iter()
+            .map(|value| {
+                Button::new(("cache-flush", *value))
+                    .label(format_interval(*value))
+                    .selected(self.cache_flush_interval_value_ms == *value)
+                    .on_click(cx.listener({
+                        let value = *value;
+                        move |view, _, _, cx| view.set_cache_flush_interval(value, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let close_buttons = [
             (CloseBehavior::Minimize, "最小化"),
             (CloseBehavior::HideToTray, "隐藏到托盘"),
@@ -939,118 +978,150 @@ impl Dashboard {
         })
         .collect::<Vec<_>>();
 
-        v_flex()
-            .size_full()
-            .gap_4()
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.55))
-                    .bg(cx.theme().background)
-                    .p_5()
-                    .child(
-                        v_flex()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("采样间隔"),
-                            )
-                            .child(h_flex().gap_2().children(interval_buttons)),
-                    ),
-            )
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.55))
-                    .bg(cx.theme().background)
-                    .p_5()
-                    .child(
-                        v_flex()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("启动与窗口"),
-                            )
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .gap_4()
-                                    .child(div().text_sm().child("开机自启"))
-                                    .child(
-                                        Switch::new("autostart")
-                                            .checked(self.autostart_enabled)
-                                            .on_click(cx.listener(|view, checked, _, cx| {
-                                                view.set_autostart(*checked, cx)
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .gap_4()
-                                    .child(div().text_sm().child("静默启动"))
-                                    .child(
-                                        Switch::new("silent-start")
-                                            .checked(self.silent_start)
-                                            .on_click(cx.listener(|view, checked, _, cx| {
-                                                view.set_silent_start(*checked, cx)
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .gap_4()
-                                    .child(div().text_sm().child("关闭按钮"))
-                                    .child(h_flex().gap_2().children(close_buttons)),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.55))
-                    .bg(cx.theme().background)
-                    .p_5()
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("数据文件"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(self.database.path().display().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(self.database.icons_path().display().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(self.database.archive_dir().display().to_string()),
-                            ),
-                    ),
-            )
+        div().size_full().overflow_y_scrollbar().child(
+            v_flex()
+                .w_full()
+                .gap_4()
+                .p_1()
+                .child(
+                    div()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.55))
+                        .bg(cx.theme().background)
+                        .p_5()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_start()
+                                .gap_6()
+                                .flex_wrap()
+                                .child(
+                                    v_flex()
+                                        .min_w(px(360.))
+                                        .flex_1()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_lg()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .child("采样间隔"),
+                                        )
+                                        .child(
+                                            h_flex().gap_2().flex_wrap().children(interval_buttons),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .min_w(px(360.))
+                                        .flex_1()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_lg()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .child("缓存写入周期"),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .flex_wrap()
+                                                .children(cache_flush_buttons),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.55))
+                        .bg(cx.theme().background)
+                        .p_5()
+                        .child(
+                            v_flex()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child("启动与窗口"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_4()
+                                        .child(div().text_sm().child("开机自启"))
+                                        .child(
+                                            Switch::new("autostart")
+                                                .checked(self.autostart_enabled)
+                                                .on_click(cx.listener(|view, checked, _, cx| {
+                                                    view.set_autostart(*checked, cx)
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_4()
+                                        .child(div().text_sm().child("静默启动"))
+                                        .child(
+                                            Switch::new("silent-start")
+                                                .checked(self.silent_start)
+                                                .on_click(cx.listener(|view, checked, _, cx| {
+                                                    view.set_silent_start(*checked, cx)
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_4()
+                                        .child(div().text_sm().child("关闭按钮"))
+                                        .child(h_flex().gap_2().children(close_buttons)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.55))
+                        .bg(cx.theme().background)
+                        .p_5()
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child("数据文件"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(self.database.path().display().to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(self.database.icons_path().display().to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(self.database.archive_dir().display().to_string()),
+                                ),
+                        ),
+                ),
+        )
     }
 
     fn render_metric(

@@ -61,10 +61,16 @@ fn run() -> Result<()> {
     let app_settings = database.app_settings()?;
     let window_size = database.get_window_size()?.unwrap_or_default();
     let interval = database.get_interval_ms()?;
+    let cache_flush_interval = database.get_cache_flush_interval_ms()?;
     let interval_ms = Arc::new(AtomicU64::new(interval));
+    let cache_flush_interval_ms = Arc::new(AtomicU64::new(cache_flush_interval));
     let exit_requested = Arc::new(AtomicBool::new(false));
     let target_hwnd = Arc::new(AtomicIsize::new(0));
-    let tracker = tracker::start(database.clone(), interval_ms.clone());
+    let tracker = tracker::start(
+        database.clone(),
+        interval_ms.clone(),
+        cache_flush_interval_ms.clone(),
+    );
     if startup::is_enabled().unwrap_or(false) {
         if let Err(error) = startup::set_enabled(true, app_settings.silent_start) {
             eprintln!("failed to sync startup command: {error:#}");
@@ -122,7 +128,6 @@ fn run() -> Result<()> {
                         px(window_size.width as f32),
                         px(window_size.height as f32),
                     ));
-                    tray::center_window(hwnd, window_size);
                     tray::hide_window(hwnd);
                 }
             }
@@ -133,6 +138,7 @@ fn run() -> Result<()> {
                 ui::Dashboard::new(
                     database,
                     interval_ms,
+                    cache_flush_interval_ms,
                     exit_requested,
                     target_hwnd,
                     tracker,
