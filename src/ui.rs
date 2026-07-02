@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
     ops::Range,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
@@ -8,10 +8,10 @@ use std::{
     time::Duration,
 };
 
-use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate};
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, Hsla, Image, ImageFormat,
-    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Pixels, Render,
+    Animation, AnimationExt, AnyElement, AppContext as _, Context, Entity, Hsla, Image,
+    ImageFormat, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
     SharedString, Styled as _, StyledImage as _, Subscription, UniformListScrollHandle, Window,
     WindowControlArea, div, img, linear_color_stop, linear_gradient, prelude::FluentBuilder as _,
     px, relative, uniform_list,
@@ -25,20 +25,27 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
-    switch::Switch,
     v_flex,
 };
 use smol::Timer;
 
 use crate::{
     db::{
-        AppTotal, CloseBehavior, DEFAULT_INTERVAL_MS, DashboardBucket, DashboardData, Database,
-        ThemePreference, TimelineItem, WindowSize,
+        CloseBehavior, DEFAULT_INTERVAL_MS, DashboardData, Database, ThemePreference, TimelineItem,
+        WindowSize,
     },
     startup,
+    todo_db::TodoDatabase,
+    todo_ui::TodoPanel,
     tracker::TrackerHandle,
     tray,
 };
+
+mod helpers;
+mod settings;
+mod todo_header;
+
+use helpers::*;
 
 const INTERVAL_PRESETS: [u64; 5] = [200, 500, 1_000, 3_000, 5_000];
 const CACHE_FLUSH_PRESETS: [u64; 4] = [5_000, 10_000, 30_000, 60_000];
@@ -52,6 +59,12 @@ enum ViewMode {
     Overview,
     Timeline,
     Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellMode {
+    Activity,
+    Todo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,7 +140,10 @@ pub struct Dashboard {
     silent_start: bool,
     close_behavior: CloseBehavior,
     cache_flush_interval_value_ms: u64,
+    todo_database_path: PathBuf,
     mode: ViewMode,
+    shell_mode: ShellMode,
+    todo_panel: Entity<TodoPanel>,
     status: String,
     _subscriptions: Vec<Subscription>,
 }
@@ -140,6 +156,7 @@ impl Dashboard {
         exit_requested: Arc<AtomicBool>,
         target_hwnd: Arc<AtomicIsize>,
         tracker: TrackerHandle,
+        todo_database: TodoDatabase,
         start_hidden: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -176,6 +193,8 @@ impl Dashboard {
                 .placeholder("标题")
                 .clean_on_escape()
         });
+        let todo_database_path = todo_database.path().to_path_buf();
+        let todo_panel = cx.new(|cx| TodoPanel::new(todo_database, window, cx));
 
         let subscriptions = vec![
             cx.observe_window_bounds(window, |view, window, _| {
@@ -259,8 +278,11 @@ impl Dashboard {
             silent_start: settings.silent_start,
             close_behavior: settings.close_behavior,
             cache_flush_interval_value_ms: settings.cache_flush_interval_ms,
+            todo_database_path,
             data,
             mode: ViewMode::Overview,
+            shell_mode: ShellMode::Activity,
+            todo_panel,
             status: if start_hidden {
                 "后台运行中".to_owned()
             } else {
@@ -435,8 +457,12 @@ impl Dashboard {
         cx.notify();
     }
 
+    pub fn persist_window_size(&mut self, window: &mut Window) {
+        self.remember_window_size(window);
+    }
+
     fn remember_window_size(&mut self, window: &mut Window) {
-        let size = window.window_bounds().get_bounds().size;
+        let size = window.viewport_size();
         let width = f32::from(size.width).round();
         let height = f32::from(size.height).round();
 
@@ -552,6 +578,14 @@ impl Dashboard {
         cx.notify();
     }
 
+    fn toggle_shell_mode(&mut self, cx: &mut Context<Self>) {
+        self.shell_mode = match self.shell_mode {
+            ShellMode::Activity => ShellMode::Todo,
+            ShellMode::Todo => ShellMode::Activity,
+        };
+        cx.notify();
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let target = self.target_hwnd.clone();
 
@@ -571,12 +605,14 @@ impl Dashboard {
             .pl_4()
             .pr_2()
             .child(
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag)
+                Button::new("shell-mode-switch")
+                    .ghost()
+                    .compact()
+                    .rounded(px(9.))
+                    .h(px(38.))
+                    .px_2()
+                    .tooltip("切换功能")
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_shell_mode(cx)))
                     .child(
                         h_flex()
                             .gap_2()
@@ -590,17 +626,30 @@ impl Dashboard {
                             ),
                     ),
             )
-            .child(self.render_nav(cx))
-            .child(self.render_time_filters(cx))
             .child(
-                div()
+                h_flex()
                     .h_full()
                     .flex_1()
-                    .window_control_area(WindowControlArea::Drag),
+                    .min_w(px(0.))
+                    .items_center()
+                    .gap_3()
+                    .overflow_hidden()
+                    .window_control_area(WindowControlArea::Drag)
+                    .when(self.shell_mode == ShellMode::Activity, |this| {
+                        this.child(self.render_nav(cx))
+                            .child(self.render_time_filters(cx))
+                    })
+                    .when(self.shell_mode == ShellMode::Todo, |this| {
+                        this.child(self.render_todo_header_controls(cx))
+                    }),
             )
             .child(
                 h_flex()
                     .h_full()
+                    .w(px(104.))
+                    .min_w(px(104.))
+                    .max_w(px(104.))
+                    .justify_end()
                     .items_center()
                     .gap_1()
                     .flex_shrink_0()
@@ -609,6 +658,11 @@ impl Dashboard {
                             .ghost()
                             .compact()
                             .small()
+                            .w(px(30.))
+                            .h(px(30.))
+                            .min_w(px(30.))
+                            .min_h(px(30.))
+                            .flex_none()
                             .rounded(px(7.))
                             .icon(if self.theme.is_dark() {
                                 IconName::Sun
@@ -629,6 +683,11 @@ impl Dashboard {
                             .ghost()
                             .compact()
                             .small()
+                            .w(px(30.))
+                            .h(px(30.))
+                            .min_w(px(30.))
+                            .min_h(px(30.))
+                            .flex_none()
                             .rounded(px(7.))
                             .icon(IconName::WindowMinimize)
                             .tooltip("最小化")
@@ -641,15 +700,23 @@ impl Dashboard {
                             .ghost()
                             .compact()
                             .small()
+                            .w(px(30.))
+                            .h(px(30.))
+                            .min_w(px(30.))
+                            .min_h(px(30.))
+                            .flex_none()
                             .rounded(px(7.))
                             .icon(IconName::WindowClose)
                             .tooltip("关闭")
-                            .on_click(cx.listener(|view, _, _, cx| view.handle_close_button(cx))),
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.handle_close_button(window, cx)
+                            })),
                     ),
             )
     }
 
-    fn handle_close_button(&mut self, cx: &mut Context<Self>) {
+    fn handle_close_button(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_window_size(window);
         match self.close_behavior {
             CloseBehavior::Minimize => {
                 tray::minimize_window(self.target_hwnd.load(Ordering::Relaxed));
@@ -931,218 +998,6 @@ impl Dashboard {
             )
             .child(timeline_head_cell("窗口类", px(150.)))
             .child(timeline_head_cell("时长", px(86.)))
-    }
-
-    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let interval_buttons = INTERVAL_PRESETS
-            .iter()
-            .map(|value| {
-                Button::new(("interval", *value))
-                    .label(format_interval(*value))
-                    .selected(self.data.interval_ms == *value)
-                    .on_click(cx.listener({
-                        let value = *value;
-                        move |view, _, _, cx| view.set_interval(value, cx)
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let cache_flush_buttons = CACHE_FLUSH_PRESETS
-            .iter()
-            .map(|value| {
-                Button::new(("cache-flush", *value))
-                    .label(format_interval(*value))
-                    .selected(self.cache_flush_interval_value_ms == *value)
-                    .on_click(cx.listener({
-                        let value = *value;
-                        move |view, _, _, cx| view.set_cache_flush_interval(value, cx)
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let close_buttons = [
-            (CloseBehavior::Minimize, "最小化"),
-            (CloseBehavior::HideToTray, "隐藏到托盘"),
-            (CloseBehavior::Exit, "退出程序"),
-        ]
-        .into_iter()
-        .map(|(behavior, label)| {
-            Button::new(("close-behavior", close_behavior_index(behavior)))
-                .label(label)
-                .compact()
-                .small()
-                .rounded(px(6.))
-                .selected(self.close_behavior == behavior)
-                .on_click(cx.listener(move |view, _, _, cx| view.set_close_behavior(behavior, cx)))
-                .into_any_element()
-        })
-        .collect::<Vec<_>>();
-
-        div().size_full().overflow_y_scrollbar().child(
-            v_flex()
-                .w_full()
-                .gap_4()
-                .p_1()
-                .child(
-                    div()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.55))
-                        .bg(cx.theme().background)
-                        .p_5()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_start()
-                                .gap_6()
-                                .flex_wrap()
-                                .child(
-                                    v_flex()
-                                        .min_w(px(360.))
-                                        .flex_1()
-                                        .gap_3()
-                                        .child(
-                                            div()
-                                                .text_lg()
-                                                .font_weight(gpui::FontWeight::BOLD)
-                                                .child("采样间隔"),
-                                        )
-                                        .child(
-                                            h_flex().gap_2().flex_wrap().children(interval_buttons),
-                                        ),
-                                )
-                                .child(
-                                    v_flex()
-                                        .min_w(px(360.))
-                                        .flex_1()
-                                        .gap_3()
-                                        .child(
-                                            div()
-                                                .text_lg()
-                                                .font_weight(gpui::FontWeight::BOLD)
-                                                .child("缓存写入周期"),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_2()
-                                                .flex_wrap()
-                                                .children(cache_flush_buttons),
-                                        ),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.55))
-                        .bg(cx.theme().background)
-                        .p_5()
-                        .child(
-                            v_flex()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .text_lg()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .child("启动与窗口"),
-                                )
-                                .child(
-                                    h_flex()
-                                        .justify_between()
-                                        .items_center()
-                                        .gap_4()
-                                        .child(div().text_sm().child("开机自启"))
-                                        .child(
-                                            Switch::new("autostart")
-                                                .checked(self.autostart_enabled)
-                                                .on_click(cx.listener(|view, checked, _, cx| {
-                                                    view.set_autostart(*checked, cx)
-                                                })),
-                                        ),
-                                )
-                                .child(
-                                    h_flex()
-                                        .justify_between()
-                                        .items_center()
-                                        .gap_4()
-                                        .child(div().text_sm().child("静默启动"))
-                                        .child(
-                                            Switch::new("silent-start")
-                                                .checked(self.silent_start)
-                                                .on_click(cx.listener(|view, checked, _, cx| {
-                                                    view.set_silent_start(*checked, cx)
-                                                })),
-                                        ),
-                                )
-                                .child(
-                                    h_flex()
-                                        .justify_between()
-                                        .items_center()
-                                        .gap_4()
-                                        .child(div().text_sm().child("关闭按钮"))
-                                        .child(h_flex().gap_2().children(close_buttons)),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.55))
-                        .bg(cx.theme().background)
-                        .p_5()
-                        .child(
-                            v_flex()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .text_lg()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .child("数据文件"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(self.database.path().display().to_string()),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(self.database.icons_path().display().to_string()),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(self.database.archive_dir().display().to_string()),
-                                ),
-                        ),
-                ),
-        )
-    }
-
-    fn render_metric(
-        &self,
-        label: &'static str,
-        value: String,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .flex_1()
-            .rounded_xl()
-            .bg(cx.theme().muted.opacity(0.45))
-            .p_4()
-            .child(
-                v_flex().gap_2().child(div().text_sm().child(label)).child(
-                    div()
-                        .text_2xl()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .child(value),
-                ),
-            )
     }
 
     fn render_usage_chart(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1602,10 +1457,17 @@ impl Render for Dashboard {
         let viewport_size = window.viewport_size();
         self.window_width = viewport_size.width.as_f32();
         self.window_height = viewport_size.height.as_f32();
-        let body = match self.mode {
-            ViewMode::Overview => self.render_overview(cx).into_any_element(),
-            ViewMode::Timeline => self.render_timeline(cx).into_any_element(),
-            ViewMode::Settings => self.render_settings(cx).into_any_element(),
+        let body = match self.shell_mode {
+            ShellMode::Activity => match self.mode {
+                ViewMode::Overview => self.render_overview(cx).into_any_element(),
+                ViewMode::Timeline => self.render_timeline(cx).into_any_element(),
+                ViewMode::Settings => self.render_settings(cx).into_any_element(),
+            },
+            ShellMode::Todo => self.todo_panel.clone().into_any_element(),
+        };
+        let shell_key = match self.shell_mode {
+            ShellMode::Activity => 0_u32,
+            ShellMode::Todo => 1_u32,
         };
 
         div()
@@ -1623,429 +1485,20 @@ impl Render for Dashboard {
                         .bg(cx.theme().background)
                         .overflow_hidden()
                         .child(self.render_header(cx))
-                        .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body)),
+                        .child(
+                            div().flex_1().min_h(px(0.)).overflow_hidden().child(
+                                div().size_full().child(body).with_animation(
+                                    ("shell-body", shell_key),
+                                    Animation::new(Duration::from_millis(260))
+                                        .with_easing(gpui::ease_out_quint()),
+                                    |this, delta| {
+                                        this.opacity((0.62 + delta * 0.38).min(1.0))
+                                            .mt(px((1.0 - delta) * 8.0))
+                                    },
+                                ),
+                            ),
+                        ),
                 ),
             )
     }
-}
-
-fn timeline_head_cell(label: &'static str, width: Pixels) -> gpui::Div {
-    div()
-        .w(width)
-        .h_full()
-        .px_3()
-        .flex()
-        .items_center()
-        .font_weight(gpui::FontWeight::BOLD)
-        .child(label)
-}
-
-fn close_behavior_index(behavior: CloseBehavior) -> usize {
-    match behavior {
-        CloseBehavior::Minimize => 0,
-        CloseBehavior::HideToTray => 1,
-        CloseBehavior::Exit => 2,
-    }
-}
-
-impl TimeFilter {
-    fn range(self, custom_range: (NaiveDate, NaiveDate)) -> TimeRange {
-        let now = Local::now();
-        let today = now.date_naive();
-
-        match self {
-            Self::Last24Hours => {
-                let end_ms = now.timestamp_millis();
-                let start_ms = end_ms.saturating_sub(DAY_MS);
-                TimeRange { start_ms, end_ms }
-            }
-            Self::Today => {
-                let (start_ms, end_ms) = day_bounds(today);
-                TimeRange { start_ms, end_ms }
-            }
-            Self::ThisWeek => {
-                let start =
-                    today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
-                let end = start + ChronoDuration::days(7);
-                TimeRange {
-                    start_ms: local_midnight_ms(start),
-                    end_ms: local_midnight_ms(end),
-                }
-            }
-            Self::ThisMonth => {
-                let start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                    .expect("month start should resolve");
-                let end = if today.month() == 12 {
-                    NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-                } else {
-                    NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
-                }
-                .expect("next month start should resolve");
-                TimeRange {
-                    start_ms: local_midnight_ms(start),
-                    end_ms: local_midnight_ms(end),
-                }
-            }
-            Self::Custom => {
-                let (start, end) = ordered_dates(custom_range.0, custom_range.1);
-                let range_end = end + ChronoDuration::days(1);
-                TimeRange {
-                    start_ms: local_midnight_ms(start),
-                    end_ms: local_midnight_ms(range_end),
-                }
-            }
-        }
-    }
-
-    fn date_range_for_picker(self, custom_range: (NaiveDate, NaiveDate)) -> (NaiveDate, NaiveDate) {
-        let now = Local::now();
-        let today = now.date_naive();
-
-        match self {
-            Self::Last24Hours => (today - ChronoDuration::days(1), today),
-            Self::Today => (today, today),
-            Self::ThisWeek => {
-                let start =
-                    today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
-                (start, start + ChronoDuration::days(6))
-            }
-            Self::ThisMonth => {
-                let start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                    .expect("month start should resolve");
-                let next_month = if today.month() == 12 {
-                    NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-                } else {
-                    NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
-                }
-                .expect("next month start should resolve");
-                (start, next_month - ChronoDuration::days(1))
-            }
-            Self::Custom => ordered_dates(custom_range.0, custom_range.1),
-        }
-    }
-}
-
-fn ordered_dates(start: NaiveDate, end: NaiveDate) -> (NaiveDate, NaiveDate) {
-    if start <= end {
-        (start, end)
-    } else {
-        (end, start)
-    }
-}
-
-fn day_bounds(date: NaiveDate) -> (i64, i64) {
-    let start_ms = local_midnight_ms(date);
-    let end_ms = local_midnight_ms(date + ChronoDuration::days(1));
-    (start_ms, end_ms)
-}
-
-fn local_midnight_ms(date: NaiveDate) -> i64 {
-    let start_naive = date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight should always be valid");
-    Local
-        .from_local_datetime(&start_naive)
-        .earliest()
-        .expect("local midnight should resolve")
-        .timestamp_millis()
-}
-
-fn group_app_totals(app_totals: &[AppTotal], total_ms: u64, display_count: usize) -> Vec<AppGroup> {
-    let display_count = display_count.max(1);
-    let visible_count = app_totals.len().min(display_count);
-    let mut groups = app_totals
-        .iter()
-        .take(visible_count)
-        .map(|total| AppGroup {
-            process_name: total.process_name.clone(),
-            icon_png: total.icon_png.clone(),
-            duration_ms: total.duration_ms,
-            percent: total.percent,
-            processes: vec![total.process_name.clone()],
-            is_other: false,
-        })
-        .collect::<Vec<_>>();
-
-    if app_totals.len() > visible_count {
-        let mut other_ms = 0_u64;
-        let mut processes = Vec::new();
-        for total in app_totals.iter().skip(visible_count) {
-            other_ms = other_ms.saturating_add(total.duration_ms);
-            processes.push(total.process_name.clone());
-        }
-        if other_ms > 0 {
-            groups.push(AppGroup {
-                process_name: "其他".to_owned(),
-                icon_png: None,
-                duration_ms: other_ms,
-                percent: if total_ms == 0 {
-                    0.0
-                } else {
-                    other_ms as f32 / total_ms as f32
-                },
-                processes,
-                is_other: true,
-            });
-        }
-    }
-
-    groups
-}
-
-fn app_area_points(
-    data: &DashboardData,
-    groups: &[AppGroup],
-    time_range: &TimeRange,
-) -> Vec<AppAreaPoint> {
-    let buckets = chart_buckets(time_range);
-    if buckets.is_empty() {
-        return Vec::new();
-    }
-
-    let group_lookup = groups
-        .iter()
-        .enumerate()
-        .flat_map(|(group_ix, group)| {
-            group
-                .processes
-                .iter()
-                .map(move |process| (process.clone(), group_ix))
-        })
-        .collect::<HashMap<_, _>>();
-
-    let mut values = vec![vec![0_f64; groups.len()]; buckets.len()];
-    for total in &data.bucket_totals {
-        let Some(group_ix) = group_lookup.get(&total.process_name).copied() else {
-            continue;
-        };
-        if let Some(bucket) = values.get_mut(total.bucket_ix) {
-            bucket[group_ix] += total.duration_ms as f64 / 60_000.0;
-        }
-    }
-
-    let values = smooth_area_values(&values);
-
-    buckets
-        .into_iter()
-        .enumerate()
-        .map(|(ix, bucket)| AppAreaPoint {
-            label: bucket.label,
-            values: values.get(ix).cloned().unwrap_or_default(),
-        })
-        .collect()
-}
-
-fn dashboard_buckets(time_range: &TimeRange) -> Vec<DashboardBucket> {
-    chart_buckets(time_range)
-        .into_iter()
-        .map(|bucket| DashboardBucket {
-            start_ms: bucket.start_ms,
-            end_ms: bucket.end_ms,
-        })
-        .collect()
-}
-
-fn smooth_area_values(values: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let bucket_count = values.len();
-    let series_count = values.first().map_or(0, Vec::len);
-    if bucket_count < 3 || series_count == 0 {
-        return values.to_vec();
-    }
-
-    let mut smoothed = vec![vec![0.0; series_count]; bucket_count];
-    for series_ix in 0..series_count {
-        let raw_sum = values
-            .iter()
-            .map(|bucket| bucket.get(series_ix).copied().unwrap_or(0.0))
-            .sum::<f64>();
-        if raw_sum <= f64::EPSILON {
-            continue;
-        }
-
-        let peak = values
-            .iter()
-            .map(|bucket| bucket[series_ix])
-            .fold(0.0_f64, f64::max);
-        let floor = (peak * 0.006).clamp(0.002, 0.05);
-
-        for bucket_ix in 0..bucket_count {
-            let previous = if bucket_ix == 0 {
-                values[bucket_ix][series_ix]
-            } else {
-                values[bucket_ix - 1][series_ix]
-            };
-            let current = values[bucket_ix][series_ix];
-            let next = values
-                .get(bucket_ix + 1)
-                .map(|bucket| bucket[series_ix])
-                .unwrap_or(current);
-
-            smoothed[bucket_ix][series_ix] = current * 0.64 + (previous + next) * 0.18;
-        }
-
-        let first_pass = smoothed
-            .iter()
-            .map(|bucket| bucket[series_ix])
-            .collect::<Vec<_>>();
-        for bucket_ix in 0..bucket_count {
-            let previous = if bucket_ix == 0 {
-                first_pass[bucket_ix]
-            } else {
-                first_pass[bucket_ix - 1]
-            };
-            let current = first_pass[bucket_ix];
-            let next = first_pass.get(bucket_ix + 1).copied().unwrap_or(current);
-
-            smoothed[bucket_ix][series_ix] = (current * 0.7 + (previous + next) * 0.15).max(floor);
-        }
-
-        let smoothed_sum = smoothed.iter().map(|bucket| bucket[series_ix]).sum::<f64>();
-        if smoothed_sum <= f64::EPSILON {
-            continue;
-        }
-
-        let scale = raw_sum / smoothed_sum;
-        for bucket in &mut smoothed {
-            bucket[series_ix] = (bucket[series_ix] * scale).max(floor);
-        }
-    }
-
-    smoothed
-}
-
-fn chart_buckets(time_range: &TimeRange) -> Vec<ChartBucket> {
-    let duration_ms = time_range.end_ms.saturating_sub(time_range.start_ms);
-    if duration_ms <= 0 {
-        return Vec::new();
-    }
-
-    let bucket_count = if duration_ms <= DAY_MS {
-        24
-    } else {
-        ((duration_ms + DAY_MS - 1) / DAY_MS).clamp(1, 31) as usize
-    };
-    let bucket_ms = ((duration_ms as f64 / bucket_count as f64).ceil() as i64).max(1);
-
-    (0..bucket_count)
-        .filter_map(|ix| {
-            let start_ms = time_range
-                .start_ms
-                .saturating_add(bucket_ms.saturating_mul(ix as i64));
-            if start_ms >= time_range.end_ms {
-                return None;
-            }
-            let end_ms = start_ms.saturating_add(bucket_ms).min(time_range.end_ms);
-            Some(ChartBucket {
-                start_ms,
-                end_ms,
-                label: bucket_label(start_ms, duration_ms),
-            })
-        })
-        .collect()
-}
-
-fn bucket_label(start_ms: i64, range_ms: i64) -> SharedString {
-    Local
-        .timestamp_millis_opt(start_ms)
-        .single()
-        .map(|time| {
-            if range_ms <= DAY_MS {
-                time.format("%H:%M").to_string().into()
-            } else {
-                time.format("%m-%d").to_string().into()
-            }
-        })
-        .unwrap_or_else(|| "".into())
-}
-
-fn empty_dashboard(interval_ms: u64) -> DashboardData {
-    DashboardData {
-        total_ms: 0,
-        interval_ms,
-        record_count: 0,
-        app_totals: Vec::new(),
-        bucket_totals: Vec::new(),
-    }
-}
-
-fn format_interval(interval_ms: u64) -> String {
-    if interval_ms % 1_000 == 0 {
-        format!("{}s", interval_ms / 1_000)
-    } else if interval_ms % 100 == 0 {
-        format!("{:.1}s", interval_ms as f64 / 1_000.0)
-    } else {
-        format!("{interval_ms}ms")
-    }
-}
-
-fn process_initial(process_name: &str) -> String {
-    process_name
-        .trim()
-        .chars()
-        .find(|ch| ch.is_alphanumeric())
-        .map(|ch| ch.to_uppercase().collect())
-        .unwrap_or_else(|| "?".to_owned())
-}
-
-fn format_duration(duration_ms: u64) -> String {
-    let total_seconds = duration_ms / 1_000;
-    let hours = total_seconds / 3_600;
-    let minutes = (total_seconds % 3_600) / 60;
-    let seconds = total_seconds % 60;
-
-    if hours > 0 {
-        format!("{hours}小时{minutes:02}分")
-    } else if minutes > 0 {
-        format!("{minutes}分{seconds:02}秒")
-    } else {
-        format!("{seconds}秒")
-    }
-}
-
-fn process_accent(process_name: &str, cx: &mut Context<Dashboard>) -> Hsla {
-    let palette = [
-        cx.theme().chart_1,
-        cx.theme().chart_2,
-        cx.theme().chart_3,
-        cx.theme().chart_4,
-        cx.theme().chart_5,
-    ];
-    let hash = process_name.bytes().fold(0_usize, |acc, byte| {
-        acc.wrapping_mul(31).wrapping_add(byte as usize)
-    });
-    palette[hash % palette.len()]
-}
-
-fn chart_color(ix: usize, cx: &mut Context<Dashboard>) -> Hsla {
-    let palette = [
-        cx.theme().blue,
-        cx.theme().green,
-        cx.theme().magenta,
-        cx.theme().yellow,
-        cx.theme().cyan,
-        cx.theme().red,
-        cx.theme().warning,
-        cx.theme().info,
-    ];
-    palette[ix % palette.len()]
-}
-
-fn date_clock(timestamp_ms: i64, show_date: bool) -> String {
-    Local
-        .timestamp_millis_opt(timestamp_ms)
-        .single()
-        .map(|time| {
-            if show_date {
-                time.format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                time.format("%H:%M:%S").to_string()
-            }
-        })
-        .unwrap_or_else(|| {
-            if show_date {
-                "---- -- --:--:--".to_owned()
-            } else {
-                "--:--:--".to_owned()
-            }
-        })
 }
