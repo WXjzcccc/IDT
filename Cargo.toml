@@ -1,6 +1,6 @@
 [package]
 name = "IDT"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "IDT (I did today) - Windows activity timeline recorder"
 publish = false
