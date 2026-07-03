@@ -4,11 +4,11 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, WPARAM},
         UI::WindowsAndMessaging::{
-            EnumWindows, FindWindowExW, FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW,
+            EnumWindows, FindWindowExW, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW,
             HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, LWA_ALPHA, SMTO_NORMAL, SW_SHOWNA,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageTimeoutW,
+            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageTimeoutW,
             SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-            WS_EX_LAYERED,
+            WS_EX_LAYERED, WS_MAXIMIZEBOX, WS_THICKFRAME,
         },
     },
     core::w,
@@ -89,6 +89,49 @@ pub fn set_window_opacity(hwnd: isize, opacity_percent: u8) {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
+pub fn disable_maximize(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+
+    update_window_style(hwnd, |style| style & !(WS_MAXIMIZEBOX.0 as isize));
+}
+
+pub fn set_window_resize_enabled(hwnd: isize, enabled: bool) {
+    if hwnd == 0 {
+        return;
+    }
+
+    update_window_style(hwnd, |style| {
+        let style = style & !(WS_MAXIMIZEBOX.0 as isize);
+        if enabled {
+            style | WS_THICKFRAME.0 as isize
+        } else {
+            style & !(WS_THICKFRAME.0 as isize)
+        }
+    });
+}
+
+fn update_window_style(hwnd: isize, update: impl FnOnce(isize) -> isize) {
+    unsafe {
+        let hwnd = HWND(hwnd as _);
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let next_style = update(style);
+        if next_style != style {
+            let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, next_style);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
     }
 }
 

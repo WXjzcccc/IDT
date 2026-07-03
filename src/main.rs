@@ -29,6 +29,8 @@ mod tray;
 #[cfg(target_os = "windows")]
 mod ui;
 #[cfg(target_os = "windows")]
+mod ui_controls;
+#[cfg(target_os = "windows")]
 mod window_util;
 
 #[cfg(target_os = "windows")]

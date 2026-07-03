@@ -10,6 +10,10 @@ use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params};
 
 const TODO_DB_NAME: &str = "todos.sqlite3";
+pub const TODO_WINDOW_MIN_WIDTH: u32 = 320;
+pub const TODO_WINDOW_MIN_HEIGHT: u32 = 260;
+const TODO_WINDOW_MAX_WIDTH: u32 = 1200;
+const TODO_WINDOW_MAX_HEIGHT: u32 = 1400;
 
 #[derive(Clone, Debug)]
 pub struct TodoItem {
@@ -90,8 +94,11 @@ impl TodoWindowTheme {
 pub struct TodoWindowSettings {
     pub theme: TodoWindowTheme,
     pub opacity_percent: u8,
+    pub locked: bool,
     pub width: u32,
     pub height: u32,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
 }
 
 impl Default for TodoWindowSettings {
@@ -99,8 +106,11 @@ impl Default for TodoWindowSettings {
         Self {
             theme: TodoWindowTheme::Light,
             opacity_percent: 96,
-            width: 440,
-            height: 620,
+            locked: false,
+            width: 420,
+            height: 520,
+            x: None,
+            y: None,
         }
     }
 }
@@ -296,20 +306,26 @@ impl TodoDatabase {
             .and_then(|value| value.parse::<u8>().ok())
             .unwrap_or(TodoWindowSettings::default().opacity_percent)
             .clamp(40, 100);
+        let locked = parse_bool_setting(setting_value(&conn, "todo_window_locked")?.as_deref());
         let width = setting_value(&conn, "todo_window_width")?
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(TodoWindowSettings::default().width)
-            .clamp(320, 1200);
+            .clamp(TODO_WINDOW_MIN_WIDTH, TODO_WINDOW_MAX_WIDTH);
         let height = setting_value(&conn, "todo_window_height")?
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(TodoWindowSettings::default().height)
-            .clamp(360, 1400);
+            .clamp(TODO_WINDOW_MIN_HEIGHT, TODO_WINDOW_MAX_HEIGHT);
+        let x = setting_value(&conn, "todo_window_x")?.and_then(parse_window_position);
+        let y = setting_value(&conn, "todo_window_y")?.and_then(parse_window_position);
 
         Ok(TodoWindowSettings {
             theme,
             opacity_percent,
+            locked,
             width,
             height,
+            x,
+            y,
         })
     }
 
@@ -321,12 +337,27 @@ impl TodoDatabase {
             "todo_window_opacity",
             settings.opacity_percent.clamp(40, 100),
         )?;
-        set_setting(&conn, "todo_window_width", settings.width.clamp(320, 1200))?;
+        set_setting(&conn, "todo_window_locked", bool_setting(settings.locked))?;
+        set_setting(
+            &conn,
+            "todo_window_width",
+            settings
+                .width
+                .clamp(TODO_WINDOW_MIN_WIDTH, TODO_WINDOW_MAX_WIDTH),
+        )?;
         set_setting(
             &conn,
             "todo_window_height",
-            settings.height.clamp(360, 1400),
+            settings
+                .height
+                .clamp(TODO_WINDOW_MIN_HEIGHT, TODO_WINDOW_MAX_HEIGHT),
         )?;
+        if let Some(x) = settings.x {
+            set_setting(&conn, "todo_window_x", x)?;
+        }
+        if let Some(y) = settings.y {
+            set_setting(&conn, "todo_window_y", y)?;
+        }
         Ok(())
     }
 
@@ -472,6 +503,34 @@ impl TodoDatabase {
             "#,
             params![completed_at_ms, now_ms, id],
         )?;
+        Ok(())
+    }
+
+    pub fn set_subtask_completed(&self, id: i64, completed: bool) -> Result<()> {
+        let now_ms = Self::now_ms();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            UPDATE todo_subtasks
+            SET completed = ?1, updated_at_ms = ?2
+            WHERE id = ?3
+            "#,
+            params![bool_int(completed), now_ms, id],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE todo_items
+            SET updated_at_ms = ?1
+            WHERE id = (
+                SELECT item_id
+                FROM todo_subtasks
+                WHERE id = ?2
+            )
+            "#,
+            params![now_ms, id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -785,6 +844,11 @@ fn set_setting(conn: &Connection, key: &str, value: impl ToString) -> Result<()>
     Ok(())
 }
 
+fn parse_window_position(value: String) -> Option<i32> {
+    let position = value.parse::<i32>().ok()?;
+    (position.abs() <= 100_000).then_some(position)
+}
+
 fn normalized_color(color: &str) -> String {
     let trimmed = color.trim();
     if trimmed.len() == 7
@@ -806,4 +870,19 @@ fn default_tag_color(ix: usize) -> &'static str {
 
 fn bool_int(value: bool) -> i64 {
     if value { 1 } else { 0 }
+}
+
+fn bool_setting(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
+}
+
+fn parse_bool_setting(value: Option<&str>) -> bool {
+    matches!(
+        value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

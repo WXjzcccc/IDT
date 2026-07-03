@@ -14,6 +14,8 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::ui_controls::red_icon_button_variant;
+
 use super::{TAGS_ICON_PATH, TodoEditor, TodoPanel, color_from_hex, form_label};
 
 const TAG_COLORS: [&str; 8] = [
@@ -283,7 +285,7 @@ impl TodoPanel {
                                 )
                                 .child(
                                     Button::new("tag-manager-close")
-                                        .ghost()
+                                        .custom(red_icon_button_variant(cx))
                                         .compact()
                                         .small()
                                         .rounded(px(7.))

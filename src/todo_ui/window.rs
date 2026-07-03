@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    Styled as _, Window, WindowControlArea, div, hsla, prelude::FluentBuilder as _, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
+    WindowControlArea, div, hsla, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, Selectable as _, Sizable as _,
@@ -14,11 +15,18 @@ use gpui_component::{
 use smol::Timer;
 
 use crate::{
-    todo_db::{TodoDatabase, TodoItem, TodoWindowSettings, TodoWindowTheme},
+    todo_db::{
+        TODO_WINDOW_MIN_HEIGHT, TODO_WINDOW_MIN_WIDTH, TodoDatabase, TodoItem, TodoSubtask,
+        TodoWindowSettings, TodoWindowTheme,
+    },
+    ui_controls::red_icon_button_variant,
     window_util,
 };
 
-use super::{color_from_hex, format_date_ms, format_duration};
+use super::{
+    LOCK_ICON_PATH, LOCK_OPEN_ICON_PATH, MONITOR_STOP_ICON_PATH, PIN_ICON_PATH, PIN_OFF_ICON_PATH,
+    color_from_hex, format_date_ms, format_duration,
+};
 
 struct TodoWindowPalette {
     background: Hsla,
@@ -36,6 +44,7 @@ pub(super) struct TodoWindow {
     topmost: bool,
     desktop_attached: bool,
     status: String,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TodoWindow {
@@ -47,6 +56,8 @@ impl TodoWindow {
     ) -> Self {
         let hwnd = window_util::hwnd_from_window(window);
         if let Some(hwnd) = hwnd {
+            window_util::disable_maximize(hwnd);
+            window_util::set_window_resize_enabled(hwnd, !settings.locked);
             window_util::set_window_opacity(hwnd, settings.opacity_percent);
         }
         let mut view = Self {
@@ -57,7 +68,12 @@ impl TodoWindow {
             topmost: false,
             desktop_attached: false,
             status: String::new(),
+            _subscriptions: Vec::new(),
         };
+        view._subscriptions
+            .push(cx.observe_window_bounds(window, |view, window, _| {
+                view.remember_window_bounds(window);
+            }));
         view.reload(cx);
         view.spawn_refresh(cx);
         view
@@ -108,6 +124,16 @@ impl TodoWindow {
         }
     }
 
+    fn set_subtask_completed(&mut self, id: i64, completed: bool, cx: &mut Context<Self>) {
+        match self.database.set_subtask_completed(id, completed) {
+            Ok(()) => self.reload(cx),
+            Err(error) => {
+                self.status = format!("保存失败: {error}");
+                cx.notify();
+            }
+        }
+    }
+
     fn set_topmost(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.topmost = enabled;
         if enabled {
@@ -129,9 +155,11 @@ impl TodoWindow {
                 self.topmost = false;
                 window_util::set_topmost(hwnd, false);
                 window_util::attach_to_desktop(hwnd);
+                window_util::set_window_opacity(hwnd, self.settings.opacity_percent);
             } else {
                 window_util::detach_from_desktop(hwnd);
                 window_util::set_topmost(hwnd, self.topmost);
+                window_util::set_window_opacity(hwnd, self.settings.opacity_percent);
             }
         }
         cx.notify();
@@ -153,11 +181,67 @@ impl TodoWindow {
         cx.notify();
     }
 
-    fn close_window(&mut self, window: &mut Window) {
+    fn set_locked(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.locked == enabled {
+            return;
+        }
+
+        if enabled {
+            self.remember_window_bounds(window);
+        }
+        self.settings.locked = enabled;
+        if let Some(hwnd) = self.hwnd {
+            window_util::set_window_resize_enabled(hwnd, !enabled);
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    pub(super) fn prepare_close(&mut self, window: &mut Window) {
+        self.remember_window_bounds(window);
         if let Some(hwnd) = self.hwnd {
             window_util::detach_from_desktop(hwnd);
         }
+    }
+
+    fn close_window(&mut self, window: &mut Window) {
+        self.prepare_close(window);
         window.remove_window();
+    }
+
+    fn remember_window_bounds(&mut self, window: &mut Window) {
+        if self.settings.locked {
+            return;
+        }
+
+        let WindowBounds::Windowed(bounds) = window.window_bounds() else {
+            return;
+        };
+        let width = f32::from(bounds.size.width).round();
+        let height = f32::from(bounds.size.height).round();
+        let x = f32::from(bounds.origin.x).round();
+        let y = f32::from(bounds.origin.y).round();
+        if !width.is_finite() || !height.is_finite() || !x.is_finite() || !y.is_finite() {
+            return;
+        }
+
+        let width = (width.max(TODO_WINDOW_MIN_WIDTH as f32)) as u32;
+        let height = (height.max(TODO_WINDOW_MIN_HEIGHT as f32)) as u32;
+        let x = x as i32;
+        let y = y as i32;
+        if self.settings.width == width
+            && self.settings.height == height
+            && self.settings.x == Some(x)
+            && self.settings.y == Some(y)
+        {
+            return;
+        }
+
+        self.settings.width = width;
+        self.settings.height = height;
+        self.settings.x = Some(x);
+        self.settings.y = Some(y);
+        self.persist_settings();
     }
 
     fn persist_settings(&mut self) {
@@ -178,7 +262,9 @@ impl TodoWindow {
             .justify_between()
             .gap_2()
             .px_3()
-            .window_control_area(WindowControlArea::Drag)
+            .when(!self.settings.locked, |this| {
+                this.window_control_area(WindowControlArea::Drag)
+            })
             .border_b_1()
             .border_color(palette.border.opacity(0.48))
             .child(
@@ -197,6 +283,7 @@ impl TodoWindow {
                     .gap_1()
                     .child(
                         Button::new("todo-window-theme")
+                            .ghost()
                             .small()
                             .compact()
                             .rounded(px(7.))
@@ -210,6 +297,7 @@ impl TodoWindow {
                     )
                     .child(
                         Button::new("todo-window-opacity-down")
+                            .ghost()
                             .small()
                             .compact()
                             .rounded(px(7.))
@@ -227,6 +315,7 @@ impl TodoWindow {
                     )
                     .child(
                         Button::new("todo-window-opacity-up")
+                            .ghost()
                             .small()
                             .compact()
                             .rounded(px(7.))
@@ -236,23 +325,50 @@ impl TodoWindow {
                     )
                     .child(
                         Button::new("todo-window-topmost")
+                            .ghost()
                             .small()
                             .compact()
                             .rounded(px(7.))
                             .selected(self.topmost)
-                            .icon(IconName::PanelBottomOpen)
+                            .icon(Icon::empty().path(if self.topmost {
+                                PIN_ICON_PATH
+                            } else {
+                                PIN_OFF_ICON_PATH
+                            }))
                             .tooltip("置顶")
                             .on_click(
                                 cx.listener(|view, _, _, cx| view.set_topmost(!view.topmost, cx)),
                             ),
                     )
                     .child(
+                        Button::new("todo-window-lock")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .rounded(px(7.))
+                            .selected(self.settings.locked)
+                            .icon(Icon::empty().path(if self.settings.locked {
+                                LOCK_ICON_PATH
+                            } else {
+                                LOCK_OPEN_ICON_PATH
+                            }))
+                            .tooltip(if self.settings.locked {
+                                "解锁"
+                            } else {
+                                "锁定"
+                            })
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.set_locked(!view.settings.locked, window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("todo-window-desktop")
+                            .ghost()
                             .small()
                             .compact()
                             .rounded(px(7.))
                             .selected(self.desktop_attached)
-                            .icon(IconName::PanelBottom)
+                            .icon(Icon::empty().path(MONITOR_STOP_ICON_PATH))
                             .tooltip("附加至桌面")
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.set_desktop_attached(!view.desktop_attached, cx)
@@ -260,7 +376,7 @@ impl TodoWindow {
                     )
                     .child(
                         Button::new("todo-window-close")
-                            .ghost()
+                            .custom(red_icon_button_variant(cx))
                             .small()
                             .compact()
                             .rounded(px(7.))
@@ -276,6 +392,11 @@ impl TodoWindow {
         let palette = todo_window_palette(self.settings.theme, cx);
         let (done, total) = item.subtask_counts();
         let due = item.due_at_ms.map(format_date_ms);
+        let subtasks = item
+            .subtasks
+            .iter()
+            .map(|subtask| self.render_subtask(subtask, &palette, cx))
+            .collect::<Vec<_>>();
 
         h_flex()
             .w_full()
@@ -336,26 +457,64 @@ impl TodoWindow {
                             }),
                         ))
                     })
-                    .when(!item.subtasks.is_empty(), |this| {
-                        this.child(v_flex().gap_1().children(item.subtasks.iter().take(3).map(
-                            |subtask| {
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .text_xs()
-                                    .text_color(palette.muted_foreground)
-                                    .child(
-                                        Icon::new(if subtask.completed {
-                                            IconName::Check
-                                        } else {
-                                            IconName::Dash
-                                        })
-                                        .xsmall(),
-                                    )
-                                    .child(subtask.title.clone())
-                            },
-                        )))
+                    .when(!subtasks.is_empty(), |this| {
+                        this.child(v_flex().gap_1().children(subtasks))
                     }),
+            )
+            .into_any_element()
+    }
+
+    fn render_subtask(
+        &self,
+        subtask: &TodoSubtask,
+        palette: &TodoWindowPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = subtask.id;
+        let completed = subtask.completed;
+        let hover_bg = palette.muted.opacity(0.72);
+        let completed_color = palette.muted_foreground.opacity(0.82);
+
+        h_flex()
+            .id(SharedString::from(format!("todo-window-subtask-{id}")))
+            .w_full()
+            .min_h(px(22.))
+            .items_center()
+            .gap_1p5()
+            .rounded(px(5.))
+            .px_1()
+            .py_0p5()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click(
+                cx.listener(move |view, _, _, cx| view.set_subtask_completed(id, !completed, cx)),
+            )
+            .child(
+                Icon::new(if completed {
+                    IconName::Check
+                } else {
+                    IconName::Dash
+                })
+                .xsmall()
+                .text_color(if completed {
+                    completed_color
+                } else {
+                    palette.muted_foreground
+                }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_xs()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .when(completed, |this| {
+                        this.text_color(completed_color).line_through()
+                    })
+                    .when(!completed, |this| this.text_color(palette.muted_foreground))
+                    .child(subtask.title.clone()),
             )
             .into_any_element()
     }

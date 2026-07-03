@@ -3,9 +3,11 @@ use std::time::Duration;
 use crate::{
     app_icon,
     todo_db::{
-        TodoDatabase, TodoDraft, TodoItem, TodoSubtaskDraft, TodoTag, date_from_ms, day_end_ms,
-        first_day_of_month, local_midnight_ms, next_month, previous_month,
+        TODO_WINDOW_MIN_HEIGHT, TODO_WINDOW_MIN_WIDTH, TodoDatabase, TodoDraft, TodoItem,
+        TodoSubtaskDraft, TodoTag, date_from_ms, day_end_ms, first_day_of_month, local_midnight_ms,
+        next_month, previous_month,
     },
+    ui_controls::red_icon_button_variant,
     window_util,
 };
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate};
@@ -14,7 +16,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
     ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, div, hsla,
-    prelude::FluentBuilder as _, px, relative, size,
+    point, prelude::FluentBuilder as _, px, relative, size,
 };
 use gpui_component::{
     ActiveTheme, IconName, PixelsExt as _, Root, Sizable as _, button::Button,
@@ -32,6 +34,11 @@ use self::window::TodoWindow;
 const WEEKDAYS: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 pub(crate) const TAGS_ICON_PATH: &str = "icons/tags.svg";
 pub(crate) const PICTURE_IN_PICTURE_ICON_PATH: &str = "icons/picture-in-picture.svg";
+pub(crate) const PIN_ICON_PATH: &str = "icons/pin.svg";
+pub(crate) const PIN_OFF_ICON_PATH: &str = "icons/pin-off.svg";
+pub(crate) const LOCK_ICON_PATH: &str = "icons/lock.svg";
+pub(crate) const LOCK_OPEN_ICON_PATH: &str = "icons/lock-open.svg";
+pub(crate) const MONITOR_STOP_ICON_PATH: &str = "icons/monitor-stop.svg";
 const MAX_WEEK_LANES: usize = 8;
 const CALENDAR_EMPTY_WEEK_HEIGHT: f32 = 44.0;
 const CALENDAR_DAY_HEADER_HEIGHT: f32 = 22.0;
@@ -378,15 +385,19 @@ impl TodoPanel {
 
     pub(crate) fn open_standalone(&mut self, cx: &mut Context<Self>) {
         let settings = self.database.todo_window_settings().unwrap_or_default();
-        let bounds = Bounds::centered(
-            None,
-            size(px(settings.width as f32), px(settings.height as f32)),
-            cx,
-        );
+        let window_size = size(px(settings.width as f32), px(settings.height as f32));
+        let bounds = if let (Some(x), Some(y)) = (settings.x, settings.y) {
+            Bounds::new(point(px(x as f32), px(y as f32)), window_size)
+        } else {
+            Bounds::centered(None, window_size, cx)
+        };
         let database = self.database.clone();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(360.), px(420.))),
+            window_min_size: Some(size(
+                px(TODO_WINDOW_MIN_WIDTH as f32),
+                px(TODO_WINDOW_MIN_HEIGHT as f32),
+            )),
             titlebar: Some(TitlebarOptions {
                 title: Some(SharedString::from("I Did Today")),
                 appears_transparent: true,
@@ -402,9 +413,16 @@ impl TodoPanel {
             window.set_window_title("I Did Today");
             if let Some(hwnd) = window_util::hwnd_from_window(window) {
                 app_icon::apply_window_icons(hwnd);
+                window_util::disable_maximize(hwnd);
+                window_util::set_window_resize_enabled(hwnd, !settings.locked);
                 window_util::set_window_opacity(hwnd, settings.opacity_percent);
             }
             let view = cx.new(|cx| TodoWindow::new(database, settings, window, cx));
+            let close_view = view.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                close_view.update(cx, |view, _| view.prepare_close(window));
+                true
+            });
             cx.new(|cx| Root::new(view, window, cx))
         }) {
             self.status = format!("窗口打开失败: {error}");
@@ -860,7 +878,7 @@ impl TodoPanel {
                                 )
                                 .child(
                                     Button::new("todo-day-details-close")
-                                        .ghost()
+                                        .custom(red_icon_button_variant(cx))
                                         .compact()
                                         .small()
                                         .rounded(px(7.))
@@ -1017,7 +1035,7 @@ impl TodoPanel {
                             )
                             .child(
                                 Button::new("todo-editor-close")
-                                    .ghost()
+                                    .custom(red_icon_button_variant(cx))
                                     .compact()
                                     .small()
                                     .rounded(px(7.))
